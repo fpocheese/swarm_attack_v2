@@ -1,18 +1,19 @@
 """
-FOV Penetration Environment — 防御方目标分配 V21
+FOV Penetration Environment — 防御方目标分配 V22
 =================================================
-基于威胁度与拦截代价的目标分配模块
+基于威胁度与拦截代价的 **初始目指** 分配模块
 
-V21 改动 (2026-03-28):
-  - 新增 ensure_full_coverage(): 保证每个存活进攻方至少有一架拦截器
-  - 多余的拦截器分配给威胁度最高的进攻方(多机围攻)
-  - 配合 config.reassign=True 周期性重分配, 进攻方死亡后释放拦截器
+V22 改动 (2026-03-29):
+  - 本模块仅用于 episode 开始时为拦截器提供"初始飞行参考目标"
+  - 后续锁定完全由 InterceptorPolicy 的 FOV 触发状态机决定
+  - 移除 ensure_full_coverage() (不再保证每个进攻方都被拦截)
+  - 移除周期性重分配支持 (config.reassign 不再使用)
+  - assign_targets() 返回初始目指分配, 仅在 env.reset() 中调用一次
 
 实现:
-  1. 为每个防御飞行器分配一个优先拦截目标
+  1. 为每个防御飞行器分配一个初始目指目标
   2. 构造代价矩阵: C[i,j] = w_threat × threat(j) + w_cost × intercept_cost(i,j)
   3. 使用匈牙利算法或贪心算法最小化总代价
-  4. ensure_full_coverage 保证全覆盖
 
 威胁度计算:
   threat(j) = 1.0 - dist(j, HVT) / max_dist  (越近 HVT 威胁越大)
@@ -221,7 +222,10 @@ def greedy_assignment(cost_matrix):
 
 def assign_targets(defensives, offensives, hvt, config):
     """
-    目标分配主接口
+    初始目指分配 (仅在 env.reset() 调用一次)
+
+    V22: 本函数仅提供初始飞行参考, 后续锁定由 FOV 触发决定。
+    不再调用 ensure_full_coverage。
 
     Args:
         defensives: list of Aircraft (防御方)
@@ -249,130 +253,24 @@ def assign_targets(defensives, offensives, hvt, config):
     else:
         raise ValueError(f"Unknown assignment method: {method}")
 
-    # V4: 保证全覆盖 — 每个存活进攻方至少一架拦截器, 多余拦截器围攻高威胁目标
-    assignments = ensure_full_coverage(
-        assignments, defensives, offensives, hvt, config, threat_scores)
+    # V22: 不再调用 ensure_full_coverage
+    # 初始分配仅作为飞行参考, 实际锁定由 FOV 触发
 
     return assignments, cost_matrix, threat_scores
 
 
+# ============================================================
+# 以下函数已弃用 (V22), 保留以防旧代码引用
+# ============================================================
+
 def ensure_full_coverage(assignments, defensives, offensives, hvt, config,
                          threat_scores=None):
     """
-    保证全覆盖: 每个存活进攻方至少一架拦截器分配
-
-    规则:
-      1. 如果存活进攻方未被任何拦截器覆盖, 优先分配最近的空闲拦截器
-      2. 如果没有空闲拦截器, 则从已分配到死亡目标的拦截器中抢夺
-      3. 多余的拦截器(比进攻方多)分配给威胁度最高的存活进攻方
-
-    Args:
-        assignments: dict {def_idx: off_idx} — 初始分配结果
-        defensives: list of Aircraft
-        offensives: list of Aircraft
-        hvt: HVT
-        config: 环境配置
-        threat_scores: ndarray or None
-
-    Returns:
-        assignments: dict {def_idx: off_idx} — 修正后的全覆盖分配
+    [DEPRECATED V22] 保证全覆盖 — 已弃用。
+    V22 不再使用周期性重分配或全覆盖保证。
+    保留此函数仅为向后兼容, 直接返回原始分配。
     """
-    n_def = len(defensives)
-    n_off = len(offensives)
-    max_dist = config["map_size"] * 2.0
-
-    # 存活进攻方集合
-    alive_off = set(j for j in range(n_off) if offensives[j].alive)
-    # 存活拦截器集合
-    alive_def = set(i for i in range(n_def) if defensives[i].alive)
-
-    if not alive_off or not alive_def:
-        return assignments
-
-    # 当前被覆盖的进攻方
-    covered_off = set()
-    for d_idx, o_idx in assignments.items():
-        if d_idx in alive_def and o_idx in alive_off:
-            covered_off.add(o_idx)
-
-    # 清理无效分配(拦截器或目标已死亡)
-    valid_assignments = {}
-    for d_idx, o_idx in assignments.items():
-        if d_idx in alive_def and o_idx in alive_off:
-            valid_assignments[d_idx] = o_idx
-    assignments = valid_assignments
-
-    # 未被覆盖的进攻方
-    uncovered_off = alive_off - covered_off
-
-    # 未分配的拦截器
-    assigned_def = set(assignments.keys())
-    unassigned_def = alive_def - assigned_def
-
-    # --- 第一步: 将空闲拦截器分配给未覆盖的进攻方 ---
-    if uncovered_off and unassigned_def:
-        # 按威胁度排序未覆盖进攻方(高威胁优先)
-        if threat_scores is not None:
-            sorted_uncovered = sorted(uncovered_off,
-                                      key=lambda j: -threat_scores[j])
-        else:
-            sorted_uncovered = sorted(uncovered_off,
-                                      key=lambda j: -compute_threat_score(
-                                          offensives[j], hvt, max_dist))
-
-        for off_idx in sorted_uncovered:
-            if not unassigned_def:
-                break
-            # 找最近的空闲拦截器
-            best_def = min(unassigned_def,
-                           key=lambda d: defensives[d].distance_3d(offensives[off_idx]))
-            assignments[best_def] = off_idx
-            unassigned_def.discard(best_def)
-            uncovered_off.discard(off_idx)
-            covered_off.add(off_idx)
-
-    # --- 第二步: 仍有未覆盖进攻方, 从多余覆盖中抢拦截器 ---
-    if uncovered_off:
-        # 统计每个进攻方被几架拦截器覆盖
-        coverage_count = {}
-        for d_idx, o_idx in assignments.items():
-            coverage_count[o_idx] = coverage_count.get(o_idx, 0) + 1
-
-        # 从覆盖数>1的进攻方中抢拦截器
-        for off_idx in sorted(uncovered_off):
-            # 找可以抢的: 被覆盖数>1的进攻方对应的拦截器(取最远的)
-            stealable = []
-            for d_idx, o_idx in list(assignments.items()):
-                if coverage_count.get(o_idx, 0) > 1:
-                    stealable.append((d_idx, o_idx))
-            if not stealable:
-                break
-            # 选离新目标最近的可抢拦截器
-            best_steal = min(stealable,
-                             key=lambda x: defensives[x[0]].distance_3d(
-                                 offensives[off_idx]))
-            steal_d, steal_from_o = best_steal
-            assignments[steal_d] = off_idx
-            coverage_count[steal_from_o] -= 1
-            coverage_count[off_idx] = coverage_count.get(off_idx, 0) + 1
-            uncovered_off.discard(off_idx)
-
-    # --- 第三步: 多余拦截器分配给威胁度最高的进攻方(围攻) ---
-    assigned_def = set(assignments.keys())
-    remaining_def = alive_def - assigned_def
-    if remaining_def and alive_off:
-        if threat_scores is not None:
-            sorted_alive = sorted(alive_off, key=lambda j: -threat_scores[j])
-        else:
-            sorted_alive = sorted(alive_off,
-                                  key=lambda j: -compute_threat_score(
-                                      offensives[j], hvt, max_dist))
-
-        for d_idx in remaining_def:
-            # 分配给威胁最高的(允许多机围攻同一目标)
-            best_off = min(sorted_alive,
-                           key=lambda j: defensives[d_idx].distance_3d(
-                               offensives[j]))
-            assignments[d_idx] = best_off
-
+    import warnings
+    warnings.warn("ensure_full_coverage is deprecated in V22. "
+                  "Lock targets are determined by FOV trigger.", DeprecationWarning)
     return assignments

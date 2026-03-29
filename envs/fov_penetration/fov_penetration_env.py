@@ -27,6 +27,8 @@ from .analytic_priors import (
     compute_escape_reward,
     compute_hvt_guidance_features,
     compute_penetration_success_score,
+    compute_decoy_game,
+    compute_effective_penetration,
 )
 
 
@@ -69,21 +71,28 @@ class FOVPenetrationEnv:
         self.hit_count = 0
         self.hit_indices = []
         self.kill_events = []
-        self.escape_events_total = []      # V11_01: 全局逃逸记录
+        self.escape_events_total = []
         self.assignments = {}
         self.lock_on_map = {}
         self.prev_team_min_dist = None
 
-        # V11_01: 交战跟踪
-        self.engagement_tracking = {}      # {(def_idx, off_idx): tracking_steps}
-        self.miss_cooldowns = {}           # {(def_idx, off_idx): remaining_cooldown}
+        # V22: 显式锁定映射 (youneedread 2.2)
+        self.locked_target_by_defender = {}  # {def_idx: off_idx or None}
+        self.locked_by_map = {}              # {off_idx: [def_idx, ...]}
+        self.lock_events_log = []            # 全局锁定事件日志
+
+        # 交战跟踪
+        self.engagement_tracking = {}
+        self.miss_cooldowns = {}
 
         # ====== Analytic Priors State ======
         self.ap_config = cfg.get("analytic_priors", {})
         self._ap_enabled = (self.ap_config.get("enable_cone_cost", False)
                             or self.ap_config.get("enable_assignment_mismatch_reward", False)
                             or self.ap_config.get("enable_escape_reward", False)
-                            or self.ap_config.get("enable_hvt_guidance", False))
+                            or self.ap_config.get("enable_hvt_guidance", False)
+                            or self.ap_config.get("enable_decoy_game", False)
+                            or self.ap_config.get("enable_effective_penetration", False))
         # Y-system cache (built once, shared across episodes)
         if self.ap_config.get("enable_cone_cost", False) or self.ap_config.get("enable_assignment_mismatch_reward", False):
             self._y_cache = YSystemCache(
@@ -111,18 +120,22 @@ class FOVPenetrationEnv:
         self._ap_attack_gate_reward = np.zeros(self.n_offensive, dtype=np.float32)
         # Curriculum: global step counter (updated externally via step)
         self._ap_global_step = 0
+        # V22: Decoy game state
+        self._ap_prev_Phi_decoy = None
+        # V22: Effective penetration state
+        self._ap_prev_N_eff = None
 
     def _compute_space_dims(self):
         cfg = self.config
         n_def = cfg["n_defensive"]
         n_off = cfg["n_offensive"]
         self.obs_k_def = min(n_def, 4)
-        # V11_01 观测空间 — 增加交战态势信息
+        # V22 观测空间 — 锁定态势信息
         # self: 9, hvt: 3
-        # 防御方(最近K个): 每个11维 (增加2维: overload_saturation, engagement_state)
-        # 队友: 每个10维 (增加1维: escaped状态)
+        # 防御方(最近K个): 每个11维 (包含: overload_saturation, lock_state)
+        # 队友: 每个10维 (包含: escaped状态)
         # 暴露: 3, 全局: 2
-        # 协同态势: 5 (增加1维: 已逃脱拦截器数)
+        # 协同态势: 5 (包含: 已逃脱拦截器数)
         self._base_obs_dim = 9 + 3 + 11 * self.obs_k_def + 10 * (n_off - 1) + 3 + 2 + 5
         # Enhancement: analytic priors obs
         # base 4 dims: Z_tilde_i, psi_agg_i, M_tilde_norm, Xi_max_i
@@ -164,9 +177,7 @@ class FOVPenetrationEnv:
             off = Aircraft(i, "offensive", off_params,
                            x=x, y=y, z=z, v=off_params["v_nominal"],
                            heading=heading, gamma=gamma)
-            # V11_01: 逃逸标记
-            off._escaped_interceptor = False
-            off._n_escapes = 0
+            # V22: 逃逸/锁定标记已在 entities.py V4 reset() 中初始化
             self.offensives.append(off)
 
         atk_cx = np.mean([o.x for o in self.offensives])
@@ -191,23 +202,51 @@ class FOVPenetrationEnv:
             self.defensive_policies.append(policy)
 
     def _run_target_assignment(self):
+        """V22: 仅在 reset() 中调用一次, 提供初始目指"""
         self.assignments, _, _ = assign_targets(
             self.defensives, self.offensives, self.hvt, self.config)
         for def_idx, off_idx in self.assignments.items():
             if def_idx < len(self.defensive_policies):
-                self.defensive_policies[def_idx].set_target(
+                self.defensive_policies[def_idx].set_initial_target(
                     off_idx, self.offensives[off_idx])
 
     def _update_lock_on_map(self):
+        """V22: 更新锁定映射 (基于实际 FOV 触发锁定状态)"""
         self.lock_on_map = {i: [] for i in range(self.n_offensive)}
+        self.locked_target_by_defender = {}
+        self.locked_by_map = {i: [] for i in range(self.n_offensive)}
+
         for def_idx, policy in enumerate(self.defensive_policies):
             d = self.defensives[def_idx]
             if not d.alive:
+                self.locked_target_by_defender[def_idx] = None
                 continue
-            if policy.target is not None and policy.target.alive:
-                off_idx = policy.assigned_target_idx
+
+            # V22: 使用锁定状态机的 current_locked_target_idx
+            if policy.lock_mode == InterceptorPolicy.STATE_LOCKED:
+                off_idx = policy.current_locked_target_idx
+                if off_idx is not None and off_idx < self.n_offensive:
+                    off = self.offensives[off_idx]
+                    if off.alive and not off.hit_hvt:
+                        self.locked_target_by_defender[def_idx] = off_idx
+                        self.locked_by_map[off_idx].append(def_idx)
+                        self.lock_on_map[off_idx].append(def_idx)
+                        # 更新 entities 中的锁定信息
+                        off.locked_by_defenders = self.locked_by_map[off_idx]
+                        off.locked_by_count = len(self.locked_by_map[off_idx])
+                        continue
+            # INIT_GUIDE 阶段: 也维护 lock_on_map (用初始分配目标)
+            elif policy.lock_mode == InterceptorPolicy.STATE_INIT_GUIDE:
+                off_idx = policy.initial_assigned_target_idx
                 if off_idx is not None and off_idx < self.n_offensive:
                     self.lock_on_map[off_idx].append(def_idx)
+
+            self.locked_target_by_defender[def_idx] = None
+
+        # 更新所有进攻方的 locked_by 信息
+        for i, off in enumerate(self.offensives):
+            off.locked_by_defenders = self.locked_by_map.get(i, [])
+            off.locked_by_count = len(off.locked_by_defenders)
 
     def reset(self):
         self.current_step = 0
@@ -227,6 +266,7 @@ class FOVPenetrationEnv:
         self.escape_events_total = []
         self.engagement_tracking = {}
         self.miss_cooldowns = {}
+        self.lock_events_log = []
 
         # ====== Analytic Priors: per-episode init ======
         if self._ap_enabled:
@@ -247,6 +287,9 @@ class FOVPenetrationEnv:
             self._ap_penetration_score = np.zeros(self.n_offensive, dtype=np.float32)
             self._ap_team_penetration_score = 0.0
             self._ap_attack_gate_reward = np.zeros(self.n_offensive, dtype=np.float32)
+            # V22: Decoy game + effective penetration per-episode state
+            self._ap_prev_Phi_decoy = None
+            self._ap_prev_N_eff = None
 
         obs = self._get_obs()
         share_obs = self._get_share_obs()
@@ -286,14 +329,28 @@ class FOVPenetrationEnv:
         just_killed_def = [alive_before_def[i] and not self.defensives[i].alive
                            for i in range(self.n_defensive)]
 
-        # 6. 更新锁定关系图
+        # 6. V22: 每步更新拦截器锁定状态 (FOV触发锁定)
+        step_lock_events = []
+        for di, policy in enumerate(self.defensive_policies):
+            if self.defensives[di].alive:
+                lock_ev = policy.update_lock_state(
+                    self.offensives, self.current_step)
+                if lock_ev is not None:
+                    step_lock_events.append(lock_ev)
+                    self.lock_events_log.append(lock_ev)
+
+        # 7. 更新锁定关系图 (基于FOV触发锁定状态)
         self._update_lock_on_map()
 
-        # 7. 可选重分配
-        if (cfg["assignment"]["reassign"] and
-                self.current_step % cfg["assignment"]["reassign_interval"] == 0):
-            self._run_target_assignment()
-            self._update_lock_on_map()
+        # V22: 记录每步脱靶量
+        point_target_cfg = self.config.get("point_target", {})
+        if point_target_cfg.get("record_miss_distance", True):
+            for off in self.offensives:
+                if off.alive and not off.hit_hvt:
+                    d_hvt = off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z)
+                    off.miss_distance_history.append(d_hvt)
+                    if d_hvt < off.min_miss_distance:
+                        off.min_miss_distance = d_hvt
 
         # 8. 更新miss冷却
         self._update_miss_cooldowns()
@@ -428,6 +485,47 @@ class FOVPenetrationEnv:
                     for i in range(min(len(per_agent_xi), self.n_offensive)):
                         self._ap_obs_cache[i, 3] = np.clip(per_agent_xi[i], 0, 2) / 2.0
                 ap_info.update(escape_info)
+
+            # --- Module 2b: Decoy Game (V22 替代旧 Assignment Mismatch) ---
+            if ap.get("enable_decoy_game", False):
+                decoy_reward, per_agent_decoy, Phi_decoy, decoy_info = compute_decoy_game(
+                    self.offensives, self.defensives, self.hvt, cfg, ap,
+                    locked_by_map=self.locked_by_map,
+                    prev_Phi_decoy=self._ap_prev_Phi_decoy)
+                self._ap_prev_Phi_decoy = Phi_decoy
+
+                for i in range(self.n_offensive):
+                    if self.offensives[i].alive:
+                        rewards_list[i] += per_agent_decoy[i] * cur_mult
+                ap_info.update(decoy_info)
+
+            # --- Module 3b: Effective Penetration (V22) ---
+            if ap.get("enable_effective_penetration", False):
+                # 收集各模块的 per-agent 风险/能力值
+                _cone_risk = [self._ap_obs_cache[i, 1] * 5.0
+                              for i in range(self.n_offensive)]  # psi_agg_i (un-normalized)
+                _lock_pressure = (decoy_info.get("lock_pressure_per_agent", [0.0] * self.n_offensive)
+                                  if ap.get("enable_decoy_game", False)
+                                  else [0.0] * self.n_offensive)
+                _locked_by_count = [len(self.locked_by_map.get(i, []))
+                                    for i in range(self.n_offensive)]
+                _E_i_esc = (escape_info.get("E_i_esc", [0.0] * self.n_offensive)
+                            if ap.get("enable_escape_reward", False)
+                            else [0.0] * self.n_offensive)
+
+                pen_reward, per_agent_pen, N_eff, pen_info = compute_effective_penetration(
+                    self.offensives, self.defensives, self.hvt, cfg, ap,
+                    cone_risk_per_agent=_cone_risk,
+                    lock_pressure_per_agent=_lock_pressure,
+                    locked_by_count_per_agent=_locked_by_count,
+                    E_i_esc_per_agent=_E_i_esc,
+                    prev_N_eff=self._ap_prev_N_eff)
+                self._ap_prev_N_eff = N_eff
+
+                for i in range(self.n_offensive):
+                    if self.offensives[i].alive:
+                        rewards_list[i] += per_agent_pen[i] * cur_mult
+                ap_info.update(pen_info)
 
             # --- Module 4: HVT Guidance + Soft Penetration Success Score ---
             if ap.get("enable_hvt_guidance", False):
@@ -633,7 +731,20 @@ class FOVPenetrationEnv:
             "avg_exposure_rate": avg_exposure / max(self.current_step, 1),
             "kill_events": list(self.kill_events),
             "lock_on_map": dict(self.lock_on_map),
-            # V11_01 新增
+            # V22: 显式锁定映射
+            "locked_target_by_defender": dict(self.locked_target_by_defender),
+            "locked_by_map": dict(self.locked_by_map),
+            "step_lock_events": step_lock_events,
+            "n_locked_defenders": sum(
+                1 for p in self.defensive_policies
+                if p.lock_mode == InterceptorPolicy.STATE_LOCKED),
+            # V22: 点目标脱靶量
+            "terminal_miss_distance_per_agent": [
+                off.min_miss_distance for off in self.offensives],
+            "terminal_miss_distance_min": min(
+                (off.min_miss_distance for off in self.offensives),
+                default=float('inf')),
+            # 逃逸统计
             "n_escapes_total": len(self.escape_events_total),
             "n_escaped_agents": n_escaped,
             "step_escapes": len(step_escapes),
@@ -650,6 +761,13 @@ class FOVPenetrationEnv:
                 info["ap_cone_escape_success"] = self._ap_cone_escape_success
         if done:
             info["bad_transition"] = (done_reason == "timeout")
+            # V22: 终端统计 (youneedread 6.7)
+            info["num_hit_hvt"] = self.hit_count
+            info["first_hit_time"] = (
+                min(off.hit_time for off in self.offensives if off.hit_time >= 0)
+                if any(off.hit_time >= 0 for off in self.offensives) else -1)
+            info["hit_agent_ids"] = list(self.hit_indices)
+            info["lock_events_log"] = list(self.lock_events_log)
 
         infos = [info for _ in range(self.n_agents)]
         obs = self._get_obs()
@@ -673,7 +791,7 @@ class FOVPenetrationEnv:
 
     def _check_kills_escapes_and_hits(self):
         """
-        V11_01 核心: 击杀/逃逸/命中判定
+        V22 核心: 击杀/逃逸/命中判定
 
         击杀条件 (三级):
           Level 1: 纯碰撞 (dist < collision_kill_range=8m) → 无条件双杀
@@ -681,12 +799,12 @@ class FOVPenetrationEnv:
           Level 3: miss (在杀伤区内但目标不在FOV → 目标逃脱)
 
         逃逸条件:
-          - 拦截器进入engagement_range后, 目标突破了FOV → 逃逸事件
+          - 拦截器锁定目标后, 目标突破了FOV → 逃逸事件
           - 拦截器PN要求过载超出极限 → 自然产生FOV丢失 → 逃逸
-          - 拦截器前向追踪放弃(目标飞到身后)  → 逃逸
+          - 拦截器放弃追击 → 逃逸
 
-        命中HVT:
-          - 进攻方到HVT距离 < hit_hvt_range → 突防成功
+        命中HVT (V22: 点目标):
+          - 进攻方到HVT距离 < 3m → 突防成功
         """
         cfg = self.config
         fov_half = cfg["fov_half_angle"]
@@ -845,14 +963,15 @@ class FOVPenetrationEnv:
                             })
 
         # ——————————————————————————————————
-        # B. 命中HVT判定
+        # B. 命中HVT判定 (V22: 点目标, 3m)
         # ——————————————————————————————————
-        hvt_range = cfg.get("hit_hvt_range", 500.0)
+        hvt_range = cfg.get("hit_hvt_range", 3.0)
         for i, off in enumerate(self.offensives):
             if not off.alive or off.hit_hvt:
                 continue
             if off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z) < hvt_range:
                 off.mark_hit_hvt()
+                off.hit_time = self.current_step
                 self.hit_count += 1
                 self.hit_indices.append(i)
                 step_hits.append(i)
@@ -892,9 +1011,9 @@ class FOVPenetrationEnv:
 
     def _get_obs(self):
         """
-        V11_01 观测空间 — 增加交战态势
+        V22 观测空间 — 增加锁定态势
         新增维度:
-          - 防御方: overload饱和度, 交战状态(0/1 engaged)
+          - 防御方: overload饱和度, 锁定状态(LOCKED与否)
           - 队友: escaped状态
           - 协同: 已逃脱拦截器数
         """
@@ -924,7 +1043,7 @@ class FOVPenetrationEnv:
         team_min_dist = min(alive_dists) if alive_dists else float('inf')
         def_alive_ratio = sum(1 for d in self.defensives if d.alive) / max(self.n_defensive, 1)
 
-        # V11_01: 已逃脱拦截器的进攻方数量
+        # V22: 已逃脱拦截器的进攻方数量
         n_escaped_agents = sum(1 for o in self.offensives
                               if hasattr(o, '_n_escapes') and o._n_escapes > 0 and o.alive)
 
@@ -989,15 +1108,15 @@ class FOVPenetrationEnv:
                         closing_v = -((rdx*(vx_a-vx_d) + rdy*(vy_a-vy_d) + rdz*(vz_a-vz_d)) / dist_d)
                         obs.append(np.clip(closing_v / vel_range, -1.0, 1.0))
 
-                        # V11_01 新增: 拦截器过载饱和度
+                        # V22: 拦截器过载饱和度
                         policy = self.defensive_policies[di_idx]
                         _, _, sat_ratio = policy.is_overload_saturated()
                         obs.append(np.clip(sat_ratio, 0.0, 3.0) / 3.0)
 
-                        # V11_01 新增: 是否在交战中 (0或1)
-                        is_engaged = 1.0 if (policy.engagement_state ==
-                                            InterceptorPolicy.STATE_ENGAGED) else 0.0
-                        obs.append(is_engaged)
+                        # V22: 是否处于LOCKED状态 (0或1)
+                        is_locked = 1.0 if (policy.lock_mode ==
+                                            InterceptorPolicy.STATE_LOCKED) else 0.0
+                        obs.append(is_locked)
                     else:
                         obs.extend([0.0] * 11)
             else:
@@ -1020,7 +1139,7 @@ class FOVPenetrationEnv:
                     mate_dist = dists_to_hvt[aj] / obs_range if dists_to_hvt[aj] < float('inf') else 1.0
                     obs.append(mate_dist)
                     obs.append(front_rank[aj] / max(self.n_offensive - 1, 1))
-                    # V11_01 新增: 队友是否已逃脱过拦截器
+                    # V22: 队友是否已逃脱过拦截器
                     obs.append(1.0 if (hasattr(teammate, '_escaped_interceptor')
                                        and teammate._escaped_interceptor) else 0.0)
                 else:
@@ -1056,7 +1175,7 @@ class FOVPenetrationEnv:
             obs.append(team_min_dist / obs_range if team_min_dist < float('inf') else 1.0)
             obs.append(def_alive_ratio)
 
-            # V11_01 新增: 全队已逃脱拦截器的数量(归一化)
+            # V22: 全队已逃脱拦截器的数量(归一化)
             obs.append(n_escaped_agents / max(self.n_offensive, 1))
 
             # === 解析先验观测 (base4 + optional6 guidance dims) ===

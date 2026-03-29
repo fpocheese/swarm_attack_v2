@@ -1,7 +1,7 @@
-"""
-FOV Penetration Environment - Entities V3
+"""  
+FOV Penetration Environment - Entities V4
 ===========================================
-三维同构飞行器 + 暴露追踪 + 命中HVT标记
+三维同构飞行器 + 暴露追踪 + 命中HVT标记 + 脱靶量记录 + 锁定状态
 """
 
 import numpy as np
@@ -34,6 +34,16 @@ class Aircraft:
         self.total_exposure_steps = 0
         self.first_detected_step = -1
         self.trajectory = [(x, y, z)]
+        # V22: 脱靶量记录 (用于点目标命中)
+        self.miss_distance_history = []     # 每步到HVT的距离
+        self.min_miss_distance = float('inf')  # 历史最小脱靶量
+        self.hit_time = -1                  # 命中时刻 (-1=未命中)
+        # V22: 进攻方逃逸标记
+        self._escaped_interceptor = False
+        self._n_escapes = 0
+        # V22: 锁定状态 (进攻方视角)
+        self.locked_by_defenders = []       # 哪些拦截器锁定了自己
+        self.locked_by_count = 0            # 被锁定数量
 
     def step(self, nx_cmd, ny_cmd, nz_cmd, dt):
         if not self.alive:
@@ -129,6 +139,14 @@ class Aircraft:
         self.total_exposure_steps = 0
         self.first_detected_step = -1
         self.trajectory = [(x, y, z)]
+        # V22
+        self.miss_distance_history = []
+        self.min_miss_distance = float('inf')
+        self.hit_time = -1
+        self._escaped_interceptor = False
+        self._n_escapes = 0
+        self.locked_by_defenders = []
+        self.locked_by_count = 0
 
 
 class HVT:

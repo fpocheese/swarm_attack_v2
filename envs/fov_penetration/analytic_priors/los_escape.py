@@ -1,12 +1,15 @@
 """
-Module 3: Near-Distance Escape via LOS Angular Rate Surge
-============================================================
+Module 3a: Near-Distance Escape via LOS Angular Rate Surge (V22)
+==================================================================
 When an attacker performs a sudden lateral maneuver at close range,
 the resulting Line-of-Sight (LOS) angular rate may exceed the
 interceptor's maximum tracking capability, causing tracking failure.
 
-This module evaluates whether the *current action* triggers such
-a tracking-loss condition and rewards the agent accordingly.
+V22 升级 (2026-03-29):
+  - 新增 E_i_esc = max_j Xi_ij 作为正式输出 → 并入 penetration_phase
+  - 新增 per-pair Gamma_ij, Xi_ij 矩阵输出
+  - 新增 omega_track_max 矩阵输出
+  - 保留旧接口向后兼容
 
 Key quantities:
   omega_los       – current LOS angular rate ||r × v|| / ||r||^2
@@ -15,11 +18,7 @@ Key quantities:
   Gamma_ij        – tracking mismatch margin  (omega_los_plus - omega_track_max)
   G_near_ij       – near-distance gate  sigmoid(k_rho * (rho_0 - rho))
   Xi_ij           – escape trigger  G_near * [Gamma]+
-  escape_reward   – sum over attackers of max_j Xi_ij
-
-Important: This module does NOT output actions.  It only evaluates
-whether the action chosen by the RL policy triggers a favorable
-near-distance escape mechanism.
+  E_i_esc         – max_j Xi_ij  (单机层逃逸能力)
 """
 
 import numpy as np
@@ -161,6 +160,8 @@ def compute_escape_reward(
 ) -> Tuple[float, List[float], Dict]:
     """Compute the near-distance escape reward for all attackers.
 
+    V22: 新增 E_i_esc, Gamma_matrix, Xi_matrix, omega_track_max_per_def
+
     Args:
         offensives:  list of offensive Aircraft
         defensives:  list of defensive Aircraft
@@ -170,7 +171,7 @@ def compute_escape_reward(
     Returns:
         total_escape_reward: scalar
         per_agent_reward:    list of per-attacker escape reward
-        info:                logging dict
+        info:                logging dict (含 E_i_esc, Gamma/Xi矩阵)
     """
     dt = config["dt"]
     lambda_E = ap_config.get("escape_reward_weight", 0.2)
@@ -184,10 +185,22 @@ def compute_escape_reward(
     n_def = len(defensives)
 
     per_agent_reward = [0.0] * n_off
+    E_i_esc = [0.0] * n_off          # V22: 单机层逃逸能力
     Gamma_all = []
     Xi_all = []
     near_triggers = 0
     max_threat_indices = []
+
+    # V22: 矩阵输出
+    Gamma_matrix = np.zeros((n_off, n_def))
+    Xi_matrix = np.zeros((n_off, n_def))
+    omega_los_matrix = np.zeros((n_off, n_def))
+    omega_track_max_per_def = np.zeros(n_def)
+
+    # 预计算拦截器最大跟踪角速度
+    for j, defn in enumerate(defensives):
+        if defn.alive:
+            omega_track_max_per_def[j] = compute_tracking_limit(defn)
 
     for i, off in enumerate(offensives):
         if not off.alive:
@@ -203,13 +216,15 @@ def compute_escape_reward(
 
             # LOS rate
             omega_los, v_t_ij, rho = compute_los_rate(off, defn)
+            omega_los_matrix[i, j] = omega_los
 
             # Tracking limit
-            omega_trk_max = compute_tracking_limit(defn)
+            omega_trk_max = omega_track_max_per_def[j]
 
             # Escape margin
             Gamma = compute_escape_margin(off, defn, v_t_ij, rho,
                                           dt_trigger, omega_trk_max)
+            Gamma_matrix[i, j] = Gamma
             Gamma_all.append(Gamma)
 
             # Near-distance gate
@@ -217,6 +232,7 @@ def compute_escape_reward(
 
             # Escape trigger
             Xi = G_near * max(0.0, Gamma)
+            Xi_matrix[i, j] = Xi
             Xi_all.append(Xi)
 
             if Xi > 0:
@@ -226,6 +242,8 @@ def compute_escape_reward(
                 Xi_max = Xi
                 max_j = j
 
+        # V22: E_i_esc = max_j Xi_ij
+        E_i_esc[i] = Xi_max
         per_agent_reward[i] = lambda_E * Xi_max
         max_threat_indices.append(max_j)
 
@@ -244,5 +262,11 @@ def compute_escape_reward(
         "max_threat_interceptor_per_agent": max_threat_indices,
         "per_agent_escape_reward": per_agent_reward,
         "_per_agent_Xi_max": per_agent_Xi_max,
+        # V22 新增
+        "E_i_esc": E_i_esc,
+        "_Gamma_matrix": Gamma_matrix,
+        "_Xi_matrix": Xi_matrix,
+        "_omega_los_matrix": omega_los_matrix,
+        "_omega_track_max_per_def": omega_track_max_per_def,
     }
     return total_escape_reward, per_agent_reward, info

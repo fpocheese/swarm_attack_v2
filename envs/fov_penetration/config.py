@@ -120,7 +120,7 @@ DEFAULT_CONFIG = {
     # === V11_01: 新型杀伤/逃逸机制 ===
     "kill_range": 50.0,            # 交战区参考半径（仅用于跟踪/脱靶逻辑，不直接击杀）
     "collision_kill_range": 3.0,   # 仅碰撞击杀阈值：脱靶量<3m 视为命中
-    "hit_hvt_range": 500.0,
+    "hit_hvt_range": 3.0,          # V22: 点目标命中, 脱靶量 ≤ 3m 才算成功
     "collision_range": 5.0,
 
     # === V11_01: FOV逃逸参数 ===
@@ -132,12 +132,21 @@ DEFAULT_CONFIG = {
         "miss_cooldown_steps": 50,     # miss后冷却(不重新交战)
     },
 
-    # === V21: 持续追击配置 ===
+    # === V22: 先入视场即锁定 — 敌方规则 ===
+    "enemy_lock_rules": {
+        "enable_fov_trigger_lock": True,          # 先入视场即锁定
+        "initial_guide_mode": "hungarian",        # 初始目指分配方式
+        "lock_fov_threshold": np.deg2rad(30.0),   # 视场触发阈值 (30° half-angle)
+        "lock_range_threshold": 2000.0,            # 锁定触发最大距离
+        "lock_persist_after_fov_loss": 20,         # 锁定后丢失FOV的宽限步数
+    },
+
+    # === V22: 锁定后追击配置 ===
     "pursuit": {
-        "forward_only": False,         # V21: 允许回头继续追击既定目标
-        "forward_half_angle": np.deg2rad(100.0),  # 前向追踪锥半角(100°, 略大于半球)
-        "abandon_on_pass": False,      # V21: 首次逃逸后也不放弃目标
-        "no_uturn": False,             # V21: 允许掉头再次拦截
+        "forward_only": False,         # 锁定后允许回头追击
+        "forward_half_angle": np.deg2rad(100.0),
+        "abandon_on_pass": False,      # 锁定后不因飞过放弃
+        "no_uturn": False,
     },
 
     "pn_nav_gain": 3,
@@ -148,8 +157,8 @@ DEFAULT_CONFIG = {
         "method": "hungarian",
         "threat_weight": 0.6,
         "intercept_cost_weight": 0.4,
-        "reassign": True,            # V21: 启用周期性重分配, 保证全覆盖
-        "reassign_interval": 20,     # V21: 每20步(2s)重分配, 及时响应目标死亡
+        "reassign": False,            # V22: 废弃周期性重分配, 由视场触发锁定替代
+        "reassign_interval": 20,      # (保留字段但无效, reassign=False)
     },
 
     # === 奖励 (V19: 大幅增强接近信号, 降低干扰项, 修复cost-reward失衡) ===
@@ -193,8 +202,10 @@ DEFAULT_CONFIG = {
     "analytic_priors": {
         # --- 全局开关 ---
         "enable_cone_cost": True,
-        "enable_assignment_mismatch_reward": True,
+        "enable_assignment_mismatch_reward": False,  # V22: 旧模块已废弃
+        "enable_decoy_game": True,                   # V22: 新的诱饵博弈模块
         "enable_escape_reward": True,
+        "enable_effective_penetration": True,          # V22: 有效突防数量
 
         # --- Module 1: Cone Cost ---
         "beta_cone_agg": 10.0,          # smooth-max temperature
@@ -211,21 +222,38 @@ DEFAULT_CONFIG = {
         "y_table_size": 500,             # Y-system lookup table resolution
         "y_integration_steps": 200,      # RK4 integration steps per t_go
 
-        # --- Module 2: Assignment Mismatch Reward ---
-        "beta_mismatch_softmin": 10.0,   # softmin temperature
-        "mismatch_reward_weight": 0.03,  # V19: 0.1→0.03, 防止干扰主接近信号
-        "lambda_eta": 1.0,              # heading correction weight in J_ij
-        "J_w_T": 1.0,                   # geometric/time cost weight
-        "J_w_D": 0.5,                   # cone escape risk weight
-        "J_w_F": 0.3,                   # info refresh cost weight
-        "f_low": 1.0,                   # low-freq sensor update rate
-        "f_high": 10.0,                 # high-freq sensor update rate
+        # --- Module 2: Decoy Game (replaces old assignment mismatch) ---
+        "enable_decoy_game": True,       # V22: 新的诱饵博弈模块
+        "k_q_sigmoid": 10.0,             # 视场占用 sigmoid 温度
+        "eta_w_s": 1.0,                  # 锁定吸引: 视场占用权重
+        "eta_w_rho": 0.5,                # 锁定吸引: 距离权重
+        "eta_w_vc": 0.3,                 # 锁定吸引: 闭合速度权重
+        "lock_prob_temperature": 5.0,    # softmax 锁定概率温度
+        "decoy_self_cost_weight": 1.0,   # 诱饵自身代价权重
+        "decoy_attention_benefit_weight": 1.5,  # 注意力吸引收益权重
+        "decoy_team_benefit_weight": 1.0,       # 队伍突防收益权重
+        "phi_decoy_weight": 0.05,        # Φ_decoy 势函数 reward 权重
+        "expose_decoy_obs": True,         # 加入 observation
 
         # --- Module 3: LOS Escape Reward ---
         "escape_reward_weight": 0.02,    # V19: 0.05→0.02, 进一步降低避免刷触发
         "rho_trigger": 150.0,           # near-distance trigger radius (m)
         "k_rho": 0.1,                   # sigmoid smoothness parameter
         "dt_trigger": None,             # override for dt (None = use env dt)
+
+        # --- Module 3b: Effective Penetration ---
+        "enable_effective_penetration": True,
+        "P_pen_cone_weight": 0.3,        # P_i_pen 中 cone safety 权重
+        "P_pen_threat_weight": 0.3,      # 拦截距离权重
+        "P_pen_redirect_weight": 0.2,    # 注意力重定向权重
+        "P_pen_escape_weight": 0.2,      # 局部逃逸能力权重
+        "kappa_h": 2.0,                  # P_i_hit miss_distance sigmoid
+        "kappa_c": 1.0,                  # P_i_hit closing speed sigmoid
+        "kappa_omega": 2.0,              # P_i_hit LOS rate sigmoid
+        "N_eff_reward_weight": 0.3,      # N_eff 增量 reward 权重
+        "N_waste_penalty_weight": 0.3,   # N_waste 惩罚权重
+        "terminal_group_value_weight": 1.0,  # 终端群体价值权重
+        "synergy_exponent": 1.5,         # N_eff^α 协同指数
 
         # --- Terminal reward params ---
         "waste_loss_weight": 0.5,        # lambda_U for N_waste penalty
@@ -246,7 +274,7 @@ DEFAULT_CONFIG = {
 
         # --- Enhancement: Attack-gated HVT shaping reward ---
         "enable_attack_gate_reward": True,
-        "attack_gate_weight": 1.5,       # V19: 3.0→1.5, 降低使接近奖励占主导
+        "attack_gate_weight": 1.0,       # V22: 1.5→1.0, N_eff为主导, 降低attack gate
         "attack_progress_weight": 1.0,
         "attack_closing_weight": 0.8,
         "attack_los_weight": 0.5,
@@ -257,14 +285,20 @@ DEFAULT_CONFIG = {
         # --- Enhancement: Per-agent cone cost ---
         "per_agent_cone_cost": True,     # each agent gets own psi_agg vs uniform split
 
-        # --- Enhancement: Cooperative mismatch reward ---
-        "cooperative_mismatch": True,    # credit individual contribution to mismatch
-        "coop_mismatch_individual_weight": 0.6,  # fraction attributed to causer vs team
+        # --- Enhancement: Cooperative decoy reward ---
+        "cooperative_decoy": True,       # credit individual contribution to decoy game
+        "coop_decoy_individual_weight": 0.6,  # fraction attributed to causer vs team
 
         # --- Enhancement: Curriculum weight scheduling ---
         "curriculum_enabled": True,
         "curriculum_warmup_frac": 0.15,  # ramp from 0→full over first 15% of training
         "curriculum_total_steps": 10000000,  # total training env steps
+    },
+
+    # === 点目标命中配置 ===
+    "point_target": {
+        "hit_threshold": 3.0,                  # 脱靶量 ≤ 3m 才算命中
+        "record_miss_distance": True,          # 逐步记录脱靶量
     },
 
     "two_stage_eval": {

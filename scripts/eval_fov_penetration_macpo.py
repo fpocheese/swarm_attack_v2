@@ -71,7 +71,14 @@ def evaluate(model_dir=None, n_episodes=20, save_gif=False,
     results = {"success": [], "attacker_killed": [], "timeout": [],
                "escorts_alive": [], "intc_alive": [],
                "episode_reward": [], "episode_cost": [],
-               "episode_length": [], "escort_kills": []}
+               "episode_length": [], "escort_kills": [],
+               # V22: 新增点目标/锁定统计
+               "hit_count": [], "first_hit_time": [],
+               "terminal_miss_dist_min": [],
+               "n_locked_defenders": [],
+               "n_escapes_total": [],
+               "N_eff": [],
+               }
 
     for ep in range(n_episodes):
         obs, _, _ = env.reset()
@@ -101,10 +108,21 @@ def evaluate(model_dir=None, n_episodes=20, save_gif=False,
         results["episode_cost"].append(ep_cost)
         results["episode_length"].append(step + 1)
         results["escort_kills"].append(len(info.get("escort_kill_events", [])))
+        # V22 metrics
+        results["hit_count"].append(info.get("hit_count", 0))
+        results["first_hit_time"].append(info.get("first_hit_time", -1))
+        results["terminal_miss_dist_min"].append(
+            info.get("terminal_miss_distance_min", float('inf')))
+        results["n_locked_defenders"].append(
+            info.get("n_locked_defenders", 0))
+        results["n_escapes_total"].append(
+            info.get("n_escapes_total", 0))
+        results["N_eff"].append(info.get("N_eff", 0.0))
 
         print(f"Ep {ep+1}/{n_episodes}: reward={ep_reward:.1f}, cost={ep_cost:.1f}, "
               f"steps={step+1}, reason={info.get('done_reason')}, "
-              f"escort_kills={len(info.get('escort_kill_events', []))}")
+              f"hits={info.get('hit_count', 0)}, "
+              f"miss_dist_min={info.get('terminal_miss_distance_min', float('inf')):.1f}m")
 
     print("\n" + "=" * 60)
     print(f"Results ({policy_name}, {n_episodes} eps)")
@@ -118,6 +136,12 @@ def evaluate(model_dir=None, n_episodes=20, save_gif=False,
     print(f"Avg escorts alive:  {np.mean(results['escorts_alive']):.2f}")
     print(f"Avg intc alive:     {np.mean(results['intc_alive']):.2f}")
     print(f"Avg escort kills:   {np.mean(results['escort_kills']):.2f}")
+    # V22 stats
+    print(f"Avg hit count:      {np.mean(results['hit_count']):.2f}")
+    valid_hits = [t for t in results['first_hit_time'] if t >= 0]
+    print(f"Avg first hit time: {np.mean(valid_hits):.1f}" if valid_hits else "First hit time: N/A")
+    valid_miss = [d for d in results['terminal_miss_dist_min'] if d < float('inf')]
+    print(f"Avg min miss dist:  {np.mean(valid_miss):.1f}m" if valid_miss else "Min miss dist: N/A")
 
     if save_gif:
         from envs.fov_penetration.render import render_episode
