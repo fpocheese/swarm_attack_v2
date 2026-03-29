@@ -1,0 +1,139 @@
+"""
+FOV Penetration Environment - Entities V3
+===========================================
+三维同构飞行器 + 暴露追踪 + 命中HVT标记
+"""
+
+import numpy as np
+from .dynamics import step_dynamics_3d, action_to_overload_3d
+
+
+class Aircraft:
+    """三维固定翼无人机 (同构, 不区分 attacker/escort)"""
+
+    def __init__(self, uid, role, params,
+                 x=0.0, y=0.0, z=500.0, v=None, heading=0.0, gamma=0.0):
+        self.uid = uid
+        self.role = role
+        self.params = params
+        self.x = x
+        self.y = y
+        self.z = z
+        self.v = v if v is not None else params["v_nominal"]
+        self.heading = heading
+        self.gamma = gamma
+        self.nx = 0.0
+        self.ny = 0.0
+        self.nz = 0.0
+        self.alive = True
+        self.hit_hvt = False
+        # 暴露追踪
+        self.detected = False
+        self.detected_by_count = 0
+        self.continuous_exposure = 0
+        self.total_exposure_steps = 0
+        self.first_detected_step = -1
+        self.trajectory = [(x, y, z)]
+
+    def step(self, nx_cmd, ny_cmd, nz_cmd, dt):
+        if not self.alive:
+            return
+        result = step_dynamics_3d(
+            self.x, self.y, self.z, self.v, self.heading, self.gamma,
+            nx_cmd, ny_cmd, nz_cmd, dt, self.params,
+            nx_prev=self.nx, ny_prev=self.ny, nz_prev=self.nz)
+        self.x, self.y, self.z = result[0], result[1], result[2]
+        self.v, self.heading, self.gamma = result[3], result[4], result[5]
+        self.nx, self.ny, self.nz = result[6], result[7], result[8]
+        self.trajectory.append((self.x, self.y, self.z))
+
+    def step_with_action(self, action, dt):
+        nx_cmd, ny_cmd, nz_cmd = action_to_overload_3d(action, self.params)
+        self.step(nx_cmd, ny_cmd, nz_cmd, dt)
+
+    def kill(self):
+        self.alive = False
+
+    def mark_hit_hvt(self):
+        self.hit_hvt = True
+
+    def update_detection(self, is_detected, detected_by_count, current_step):
+        self.detected = is_detected
+        self.detected_by_count = detected_by_count
+        if is_detected:
+            self.continuous_exposure += 1
+            self.total_exposure_steps += 1
+            if self.first_detected_step < 0:
+                self.first_detected_step = current_step
+        else:
+            self.continuous_exposure = 0
+
+    def distance_to(self, ox, oy, oz=None):
+        dx = self.x - ox
+        dy = self.y - oy
+        if oz is not None:
+            dz = self.z - oz
+            return np.sqrt(dx**2 + dy**2 + dz**2)
+        return np.sqrt(dx**2 + dy**2)
+
+    def distance_3d(self, other):
+        return self.distance_to(other.x, other.y, other.z)
+
+    def relative_bearing(self, target_x, target_y):
+        dx = target_x - self.x
+        dy = target_y - self.y
+        angle_to_target = np.arctan2(dy, dx)
+        relative = angle_to_target - self.heading
+        return np.arctan2(np.sin(relative), np.cos(relative))
+
+    def relative_elevation(self, target_x, target_y, target_z):
+        dx = target_x - self.x
+        dy = target_y - self.y
+        dz = target_z - self.z
+        horizontal_dist = np.sqrt(dx**2 + dy**2)
+        return np.arctan2(dz, max(horizontal_dist, 1.0))
+
+    def is_in_fov(self, target_x, target_y, target_z,
+                  fov_half_angle, detection_range):
+        dist = self.distance_to(target_x, target_y, target_z)
+        if dist > detection_range or dist < 0.1:
+            return False
+        dx = target_x - self.x
+        dy = target_y - self.y
+        dz = target_z - self.z
+        cos_g = np.cos(self.gamma)
+        vx = cos_g * np.cos(self.heading)
+        vy = cos_g * np.sin(self.heading)
+        vz = np.sin(self.gamma)
+        tx, ty, tz = dx / dist, dy / dist, dz / dist
+        dot = np.clip(vx * tx + vy * ty + vz * tz, -1.0, 1.0)
+        off_axis_angle = np.arccos(dot)
+        return off_axis_angle <= fov_half_angle
+
+    def get_state(self):
+        return np.array([self.x, self.y, self.z, self.v,
+                         self.heading, self.gamma,
+                         float(self.alive)], dtype=np.float32)
+
+    def reset(self, x, y, z, v, heading, gamma=0.0):
+        self.x, self.y, self.z = x, y, z
+        self.v = v
+        self.heading = heading
+        self.gamma = gamma
+        self.nx = self.ny = self.nz = 0.0
+        self.alive = True
+        self.hit_hvt = False
+        self.detected = False
+        self.detected_by_count = 0
+        self.continuous_exposure = 0
+        self.total_exposure_steps = 0
+        self.first_detected_step = -1
+        self.trajectory = [(x, y, z)]
+
+
+class HVT:
+    """高价值目标 (静止)"""
+    def __init__(self, x, y, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
