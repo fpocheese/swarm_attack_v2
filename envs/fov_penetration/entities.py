@@ -5,7 +5,7 @@ FOV Penetration Environment - Entities V4
 """
 
 import numpy as np
-from .dynamics import step_dynamics_3d, action_to_overload_3d
+from .dynamics import step_dynamics_3d, action_to_control_3d
 
 
 class Aircraft:
@@ -22,9 +22,9 @@ class Aircraft:
         self.v = v if v is not None else params["v_nominal"]
         self.heading = heading
         self.gamma = gamma
-        self.nx = 0.0
-        self.ny = 0.0
-        self.nz = 0.0
+        self.ax = 0.0       # 轴向加速度 (m/s²)
+        self.ay = 0.0       # 法向加速度大小 (m/s²)
+        self.mu = 0.0       # 法向加速度方向角 (rad)
         self.alive = True
         self.hit_hvt = False
         # 暴露追踪
@@ -45,21 +45,23 @@ class Aircraft:
         self.locked_by_defenders = []       # 哪些拦截器锁定了自己
         self.locked_by_count = 0            # 被锁定数量
 
-    def step(self, nx_cmd, ny_cmd, nz_cmd, dt):
+    def step(self, ax_cmd, ay_cmd, mu_cmd, dt):
+        """执行一步动力学更新, 控制输入 (ax, ay, mu)"""
         if not self.alive:
             return
         result = step_dynamics_3d(
             self.x, self.y, self.z, self.v, self.heading, self.gamma,
-            nx_cmd, ny_cmd, nz_cmd, dt, self.params,
-            nx_prev=self.nx, ny_prev=self.ny, nz_prev=self.nz)
+            ax_cmd, ay_cmd, mu_cmd, dt, self.params,
+            ax_prev=self.ax, ay_prev=self.ay, mu_prev=self.mu)
         self.x, self.y, self.z = result[0], result[1], result[2]
         self.v, self.heading, self.gamma = result[3], result[4], result[5]
-        self.nx, self.ny, self.nz = result[6], result[7], result[8]
+        self.ax, self.ay, self.mu = result[6], result[7], result[8]
         self.trajectory.append((self.x, self.y, self.z))
 
     def step_with_action(self, action, dt):
-        nx_cmd, ny_cmd, nz_cmd = action_to_overload_3d(action, self.params)
-        self.step(nx_cmd, ny_cmd, nz_cmd, dt)
+        """RL 动作接口: 归一化动作 [-1,1]^3 → (ax, ay, mu) → 动力学更新"""
+        ax_cmd, ay_cmd, mu_cmd = action_to_control_3d(action, self.params)
+        self.step(ax_cmd, ay_cmd, mu_cmd, dt)
 
     def kill(self):
         self.alive = False
@@ -130,7 +132,7 @@ class Aircraft:
         self.v = v
         self.heading = heading
         self.gamma = gamma
-        self.nx = self.ny = self.nz = 0.0
+        self.ax = self.ay = self.mu = 0.0
         self.alive = True
         self.hit_hvt = False
         self.detected = False

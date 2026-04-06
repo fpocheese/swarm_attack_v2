@@ -1,109 +1,125 @@
 """
-FOV Penetration Environment - 3D Dynamics V3
+FOV Penetration Environment - 3D Dynamics V4
 ==============================================
-三维固定翼无人机质点运动学模型 (含过载变化率限制)
+三维固定翼无人机质点运动学模型 (轴向加速度 + 法向加速度大小 + 法向方向角)
 
-状态量: [x, y, z, v, heading, gamma]
-控制量: [nx_cmd, ny_cmd, nz_cmd]
+状态量: [x, y, z, v, heading(psi), gamma]
+控制量: [ax, ay, mu]
+  - ax:  轴向加速度 (沿速度方向, m/s²)
+  - ay:  法向加速度大小 (≥0, m/s²)
+  - mu:  法向加速度方向角 (rad, 确定法向加速度在水平/垂直方向的分配)
 
 运动方程:
-  v_dot     = g * nx
-  psi_dot   = g * ny / (v * cos(gamma))
-  gamma_dot = g * (nz - cos(gamma)) / v
   x_dot     = v * cos(gamma) * cos(psi)
   y_dot     = v * cos(gamma) * sin(psi)
   z_dot     = v * sin(gamma)
+  v_dot     = ax - g * sin(gamma)
+  psi_dot   = ay * cos(mu) / (v * cos(gamma))
+  gamma_dot = (ay * sin(mu) - g * cos(gamma)) / v
 
 积分方法: 四阶 Runge-Kutta (RK4)
-防抖头: 过载变化率限制 |dn/dt| <= dn_max
+防抖: 控制量变化率限制
 """
 
 import numpy as np
 from .config import G
 
-
-def rate_limit_overload(nx_cmd, ny_cmd, nz_cmd,
-                        nx_prev, ny_prev, nz_prev,
-                        dt, params):
-    """三维过载变化率限制"""
-    dnx_max = params.get("dnx_max", 999.0)
-    dny_max = params.get("dny_max", 999.0)
-    dnz_max = params.get("dnz_max", 999.0)
-
-    max_dnx = dnx_max * dt
-    max_dny = dny_max * dt
-    max_dnz = dnz_max * dt
-
-    nx_lim = nx_prev + np.clip(nx_cmd - nx_prev, -max_dnx, max_dnx)
-    ny_lim = ny_prev + np.clip(ny_cmd - ny_prev, -max_dny, max_dny)
-    nz_lim = nz_prev + np.clip(nz_cmd - nz_prev, -max_dnz, max_dnz)
-
-    return nx_lim, ny_lim, nz_lim
+# --- 数值保护常量 ---
+_V_MIN_EPS = 1.0       # 速度下限保护 (m/s)
+_COS_GAMMA_EPS = 0.01  # cos(gamma) 下限保护
 
 
-def _derivatives_3d(state, nx, ny, nz, v_min):
+def rate_limit_control(ax_cmd, ay_cmd, mu_cmd,
+                       ax_prev, ay_prev, mu_prev,
+                       dt, params):
+    """控制量变化率限制 (ax, ay, mu)"""
+    dax_max = params.get("dax_max", 999.0)
+    day_max = params.get("day_max", 999.0)
+    dmu_max = params.get("dmu_max", 999.0)
+
+    max_dax = dax_max * dt
+    max_day = day_max * dt
+    max_dmu = dmu_max * dt
+
+    ax_lim = ax_prev + np.clip(ax_cmd - ax_prev, -max_dax, max_dax)
+    ay_lim = ay_prev + np.clip(ay_cmd - ay_prev, -max_day, max_day)
+    # mu 角度差需要处理周期性
+    dmu = np.arctan2(np.sin(mu_cmd - mu_prev), np.cos(mu_cmd - mu_prev))
+    mu_lim = mu_prev + np.clip(dmu, -max_dmu, max_dmu)
+
+    return ax_lim, ay_lim, mu_lim
+
+
+def _derivatives_3d(state, ax, ay, mu, v_min):
     """
-    三维运动学微分方程
-    state = [v, heading, gamma]
-    返回 [v_dot, heading_dot, gamma_dot]
+    三维运动学微分方程 (新控制输入形式)
+    state = [v, heading(psi), gamma]
+    control = [ax, ay, mu]
+    返回 [v_dot, psi_dot, gamma_dot]
     """
     v, psi, gamma = state
-    v = max(v, v_min)
-    cos_gamma = np.cos(gamma)
-    if abs(cos_gamma) < 0.01:
-        cos_gamma = 0.01 * np.sign(cos_gamma) if cos_gamma != 0 else 0.01
+    v_safe = max(v, max(v_min, _V_MIN_EPS))
 
-    v_dot = G * nx
-    psi_dot = G * ny / (v * cos_gamma)
-    gamma_dot = G * (nz - np.cos(gamma)) / v
+    cos_gamma = np.cos(gamma)
+    # 防止 cos(gamma) 过小导致除零
+    if abs(cos_gamma) < _COS_GAMMA_EPS:
+        cos_gamma = _COS_GAMMA_EPS * (1.0 if cos_gamma >= 0 else -1.0)
+
+    v_dot = ax - G * np.sin(gamma)
+    psi_dot = ay * np.cos(mu) / (v_safe * cos_gamma)
+    gamma_dot = (ay * np.sin(mu) - G * np.cos(gamma)) / v_safe
 
     return np.array([v_dot, psi_dot, gamma_dot])
 
 
 def step_dynamics_3d(x, y, z, v, heading, gamma,
-                     nx_cmd, ny_cmd, nz_cmd,
+                     ax_cmd, ay_cmd, mu_cmd,
                      dt, params,
-                     nx_prev=None, ny_prev=None, nz_prev=None):
+                     ax_prev=None, ay_prev=None, mu_prev=None):
     """
-    一步三维动力学更新 (RK4 积分 + 过载变化率限制)
+    一步三维动力学更新 (RK4 积分 + 控制量变化率限制)
+
+    控制输入:
+        ax_cmd: 轴向加速度指令 (m/s²)
+        ay_cmd: 法向加速度大小指令 (m/s², ≥0)
+        mu_cmd: 法向加速度方向角指令 (rad)
 
     Returns:
-        x, y, z, v, heading, gamma, nx_actual, ny_actual, nz_actual
+        x, y, z, v, heading, gamma, ax_actual, ay_actual, mu_actual
     """
     v_min = params["v_min"]
     v_max = params["v_max"]
-    nx_min = params["nx_min"]
-    nx_max = params["nx_max"]
-    ny_min = params["ny_min"]
-    ny_max = params["ny_max"]
-    nz_min = params.get("nz_min", -3.0)
-    nz_max_val = params.get("nz_max", 3.0)
+    ax_min = params["ax_min"]
+    ax_max_val = params["ax_max"]
+    ay_max_val = params["ay_max"]
     gamma_min = params.get("gamma_min", np.deg2rad(-45.0))
     gamma_max = params.get("gamma_max", np.deg2rad(45.0))
 
-    # 裁剪过载指令
-    nx_cmd = np.clip(nx_cmd, nx_min, nx_max)
-    ny_cmd = np.clip(ny_cmd, ny_min, ny_max)
-    nz_cmd = np.clip(nz_cmd, nz_min, nz_max_val)
+    # 裁剪控制指令
+    ax_cmd = np.clip(ax_cmd, ax_min, ax_max_val)
+    ay_cmd = np.clip(ay_cmd, 0.0, ay_max_val)
+    # mu 归一化到 [-pi, pi]
+    mu_cmd = np.arctan2(np.sin(mu_cmd), np.cos(mu_cmd))
 
-    # 过载变化率限制
-    if nx_prev is not None and ny_prev is not None and nz_prev is not None:
-        nx_actual, ny_actual, nz_actual = rate_limit_overload(
-            nx_cmd, ny_cmd, nz_cmd, nx_prev, ny_prev, nz_prev, dt, params)
+    # 控制量变化率限制
+    if ax_prev is not None and ay_prev is not None and mu_prev is not None:
+        ax_actual, ay_actual, mu_actual = rate_limit_control(
+            ax_cmd, ay_cmd, mu_cmd, ax_prev, ay_prev, mu_prev, dt, params)
     else:
-        nx_actual, ny_actual, nz_actual = nx_cmd, ny_cmd, nz_cmd
+        ax_actual, ay_actual, mu_actual = ax_cmd, ay_cmd, mu_cmd
 
-    nx_actual = np.clip(nx_actual, nx_min, nx_max)
-    ny_actual = np.clip(ny_actual, ny_min, ny_max)
-    nz_actual = np.clip(nz_actual, nz_min, nz_max_val)
+    # 再次裁剪 (变化率限制后可能仍需保证合法)
+    ax_actual = np.clip(ax_actual, ax_min, ax_max_val)
+    ay_actual = np.clip(ay_actual, 0.0, ay_max_val)
+    mu_actual = np.arctan2(np.sin(mu_actual), np.cos(mu_actual))
 
-    # RK4
+    # RK4 积分
     state = np.array([v, heading, gamma])
 
-    k1 = _derivatives_3d(state, nx_actual, ny_actual, nz_actual, v_min)
-    k2 = _derivatives_3d(state + 0.5 * dt * k1, nx_actual, ny_actual, nz_actual, v_min)
-    k3 = _derivatives_3d(state + 0.5 * dt * k2, nx_actual, ny_actual, nz_actual, v_min)
-    k4 = _derivatives_3d(state + dt * k3, nx_actual, ny_actual, nz_actual, v_min)
+    k1 = _derivatives_3d(state, ax_actual, ay_actual, mu_actual, v_min)
+    k2 = _derivatives_3d(state + 0.5 * dt * k1, ax_actual, ay_actual, mu_actual, v_min)
+    k3 = _derivatives_3d(state + 0.5 * dt * k2, ax_actual, ay_actual, mu_actual, v_min)
+    k4 = _derivatives_3d(state + dt * k3, ax_actual, ay_actual, mu_actual, v_min)
 
     state_new = state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
@@ -120,50 +136,55 @@ def step_dynamics_3d(x, y, z, v, heading, gamma,
     y_new = y + v_new * cos_g * np.sin(heading_new) * dt
     z_new = z + v_new * np.sin(gamma_new) * dt
 
-    return x_new, y_new, z_new, v_new, heading_new, gamma_new, nx_actual, ny_actual, nz_actual
+    return x_new, y_new, z_new, v_new, heading_new, gamma_new, ax_actual, ay_actual, mu_actual
 
 
-def action_to_overload_3d(action, params):
+def action_to_control_3d(action, params):
     """
-    将归一化动作 [-1, 1]^3 映射到实际过载指令
+    将归一化动作 [-1, 1]^3 映射到实际控制指令 (ax, ay, mu)
 
-    action[0] -> nx: [-1,1] -> [nx_min, nx_max]  (线性映射, 0 -> 中值)
-    action[1] -> ny: [-1,1] -> [ny_min, ny_max]  (线性映射, 0 -> 0)
-    action[2] -> nz: [-1,1] -> [nz_min, nz_max]  (偏置映射, 0 -> 1.0 即平飞)
+    V28: 添加重力补偿偏置 → action=[0,0,0] 对应平飞(trim)
+    
+    action[0] -> ax:  偏置映射, 0 -> 0 (水平巡航时 v_dot ≈ 0)
+    action[1] -> ay:  偏置映射, 0 -> G (重力补偿), -1 -> 0, +1 -> ay_max
+    action[2] -> mu:  偏置映射, 0 -> pi/2 (法向力朝上), 范围 [-pi/2, 3pi/2]
 
-    V11c关键改进: 加入action_scale参数, 控制动作幅度
-    scale=0.3意味着最大只用到30%的过载范围
-    这让策略从"接近直飞"开始微调, 而不是剧烈机动
+    这样 action=[0,0,0] 时:
+      ax=0, ay=G, mu=pi/2  
+      → gamma_dot = (G*sin(pi/2) - G*cos(gamma))/v ≈ 0  (平飞)
+      → psi_dot = G*cos(pi/2)/(v*cos(gamma)) = 0         (直飞)
     """
     a = np.array(action, dtype=np.float32)
     a = np.clip(a, -1.0, 1.0)
 
     # 动作缩放: 让策略从小扰动开始学
-    action_scale = params.get("action_scale", 0.3)
+    action_scale = params.get("action_scale", 1.0)
     a = a * action_scale
 
-    nx_min = params["nx_min"]
-    nx_max = params["nx_max"]
-    ny_min = params["ny_min"]
-    ny_max = params["ny_max"]
-    nz_min = params.get("nz_min", -0.5)
-    nz_max_val = params.get("nz_max", 1.5)
+    ax_min = params["ax_min"]
+    ax_max_val = params["ax_max"]
+    ay_max_val = params["ay_max"]
 
-    # nx: 偏置映射, action=0 -> nx=0.5 (轻微加速/巡航)
-    nx_center = 0.5
+    # ax: 偏置映射, action=0 → ax=0 (水平巡航)
+    ax_center = 0.0
     if a[0] <= 0:
-        nx = nx_center + a[0] * (nx_center - nx_min)
+        ax = ax_center + a[0] * (ax_center - ax_min)
     else:
-        nx = nx_center + a[0] * (nx_max - nx_center)
+        ax = ax_center + a[0] * (ax_max_val - ax_center)
 
-    # ny: 标准线性映射 (0 -> 0 = 直飞)
-    ny = ny_min + (a[1] + 1.0) * 0.5 * (ny_max - ny_min)
-
-    # nz: 偏置映射, action=0 -> nz=1.0(平飞)
-    nz_level = 1.0
-    if a[2] <= 0:
-        nz = nz_level + a[2] * (nz_level - nz_min)
+    # ay: 偏置映射, action=0 → ay=G (重力补偿), -1 → 0, +1 → ay_max
+    ay_level = G  # 9.81 m/s², 刚好抵消重力
+    if a[1] >= 0:
+        ay = ay_level + a[1] * (ay_max_val - ay_level)
     else:
-        nz = nz_level + a[2] * (nz_max_val - nz_level)
+        ay = ay_level * (1.0 + a[1])  # a[1]=-1 → ay=0
 
-    return nx, ny, nz
+    # mu: 偏置映射, action=0 → mu=pi/2 (法向力朝上=平飞)
+    # 范围: a[2]=-1 → mu=-pi/2, a[2]=0 → mu=pi/2, a[2]=1 → mu=3pi/2
+    mu = np.pi / 2.0 + a[2] * np.pi
+
+    return ax, ay, mu
+
+
+# === 向后兼容别名 ===
+action_to_overload_3d = action_to_control_3d

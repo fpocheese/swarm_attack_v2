@@ -15,8 +15,8 @@ from gym.spaces import Box
 
 from .config import get_config, G
 from .entities import Aircraft, HVT
-from .dynamics import action_to_overload_3d
-from .reward_cost import compute_rewards, compute_costs
+from .dynamics import action_to_control_3d
+from .reward_cost import compute_rewards, compute_costs, compute_terminal_rewards
 from .policies_interceptor import InterceptorPolicy
 from .target_assignment import assign_targets
 from .analytic_priors import (
@@ -106,49 +106,59 @@ class FOVPenetrationEnv:
         else:
             self._y_cache = None
 
-        # Per-episode analytic priors state (initialized in reset)
+        # V28: Analytic priors per-episode state (initialized in reset)
         self._ap_prev_q_matrix = None
         self._ap_fixed_assignment = {}
         self._ap_prev_M_tilde = None
-        self._ap_episode_max_M_tilde = 0.0
-        self._ap_cone_escape_success = 0  # escape while cone risk was high
-        # Per-agent analytic obs cache (for _get_obs)
-        self._ap_obs_cache = np.zeros((self.n_offensive, self._ap_obs_dim), dtype=np.float32)
         self._ap_prev_hvt_omega = np.zeros(self.n_offensive, dtype=np.float32)
-        self._ap_penetration_score = np.zeros(self.n_offensive, dtype=np.float32)
-        self._ap_team_penetration_score = 0.0
-        self._ap_attack_gate_reward = np.zeros(self.n_offensive, dtype=np.float32)
-        # Curriculum: global step counter (updated externally via step)
         self._ap_global_step = 0
-        # V22: Decoy game state
         self._ap_prev_Phi_decoy = None
-        # V22: Effective penetration state
         self._ap_prev_N_eff = None
 
+        # V28: New analytic data caches for obs building
+        self._ap_decoy_info = {}
+        self._ap_pen_info = {}
+        self._ap_esc_info = {}
+        self._ap_hvt_info = {}
+        self._ap_Z_matrix = np.zeros((self.n_offensive, self.n_defensive), dtype=np.float32)
+        self._ap_Z_tilde = np.zeros(self.n_offensive, dtype=np.float32)
+        self._ap_psi_agg = np.zeros(self.n_offensive, dtype=np.float32)
+        self._ap_Gamma_matrix = [[0.0] * self.n_defensive for _ in range(self.n_offensive)]
+        self._ap_Xi_matrix = [[0.0] * self.n_defensive for _ in range(self.n_offensive)]
+        self._ap_prev_E_esc = None
+
     def _compute_space_dims(self):
+        """V35 观测空间: 目标优先 (Target-First)
+        1. Self State:                  10
+        2. HVT Target Guidance (扩展):    8  (+heading_error, dist_ratio, teammate_cover)
+        3. Top-2 Threat Interceptors:   6*2 = 12  (精简: 去掉Gamma/Xi/Z)
+        4. Team Situation:               4  (精简: 队友锁定/自由 + team_score + 存活比)
+        5. Analytic Prior Summary:       2  (仅P_pen, P_hit)
+        6. Time feature:                 1
+        Total: 37
+        """
         cfg = self.config
-        n_def = cfg["n_defensive"]
         n_off = cfg["n_offensive"]
-        self.obs_k_def = min(n_def, 4)
-        # V22 观测空间 — 锁定态势信息
-        # self: 9, hvt: 3
-        # 防御方(最近K个): 每个11维 (包含: overload_saturation, lock_state)
-        # 队友: 每个10维 (包含: escaped状态)
-        # 暴露: 3, 全局: 2
-        # 协同态势: 5 (包含: 已逃脱拦截器数)
-        self._base_obs_dim = 9 + 3 + 11 * self.obs_k_def + 10 * (n_off - 1) + 3 + 2 + 5
-        # Enhancement: analytic priors obs
-        # base 4 dims: Z_tilde_i, psi_agg_i, M_tilde_norm, Xi_max_i
-        # optional +6 dims: rho_hvt, closing_hvt, omega_los_hvt, omega_los_dot_hvt, pn_hint_hvt, penetration_score
-        ap_cfg = cfg.get("analytic_priors", {})
-        self._ap_base_obs_dim = 4 if ap_cfg.get("expose_analytic_obs", False) else 0
-        self._ap_guidance_obs_dim = 6 if (ap_cfg.get("expose_analytic_obs", False)
-                          and ap_cfg.get("expose_hvt_guidance_obs", False)) else 0
-        self._ap_obs_dim = self._ap_base_obs_dim + self._ap_guidance_obs_dim
-        self.obs_dim = self._base_obs_dim + self._ap_obs_dim
-        self._ap_share_extra_dim = 1 if (ap_cfg.get("expose_penetration_share_obs", False)
-                         and ap_cfg.get("enable_hvt_guidance", False)) else 0
-        self.share_obs_dim = 10 * n_off + 7 * n_def + 3 + 5 + self._ap_share_extra_dim
+        self.obs_k_def = min(cfg["n_defensive"], 4)
+
+        # V35 观测维度 — 目标优先
+        self._dim_self = 10
+        self._dim_hvt_guidance = 8   # V35: 5→8, 新增heading_error, dist_progress, teammate_cover
+        self._dim_per_threat = 6     # V35: 9→6, 去掉Gamma, Xi, Z (太抽象)
+        self._n_top_threats = 2
+        self._dim_threats = self._dim_per_threat * self._n_top_threats  # 12
+        self._dim_team_game = 4      # V35: 6→4, 去掉decoy/penetrator角色
+        self._dim_priors = 2         # V35: 5→2, 仅P_pen, P_hit
+        self._dim_time = 1
+
+        self.obs_dim = (self._dim_self + self._dim_hvt_guidance
+                        + self._dim_threats + self._dim_team_game
+                        + self._dim_priors + self._dim_time)  # 37
+
+        # share obs: 所有进攻方 10维 + 所有防御方 7维 + HVT 3维 + global 5维 + team_pen 1维
+        self.share_obs_dim = 10 * n_off + 7 * cfg["n_defensive"] + 3 + 5 + 1
+
+        self._ap_obs_dim = 0
 
     def seed(self, seed=None):
         self._seed = seed
@@ -268,11 +278,9 @@ class FOVPenetrationEnv:
         self.miss_cooldowns = {}
         self.lock_events_log = []
 
-        # ====== Analytic Priors: per-episode init ======
+        # ====== V28: Analytic Priors per-episode init ======
         if self._ap_enabled:
-            # Cone cost: initialize q_matrix to None (first step will use current as prev)
             self._ap_prev_q_matrix = None
-            # Assignment mismatch: compute fixed assignment pi_0
             if self.ap_config.get("enable_assignment_mismatch_reward", False):
                 self._ap_fixed_assignment = compute_initial_assignment(
                     self.offensives, self.defensives,
@@ -280,16 +288,53 @@ class FOVPenetrationEnv:
             else:
                 self._ap_fixed_assignment = {}
             self._ap_prev_M_tilde = None
-            self._ap_episode_max_M_tilde = 0.0
-            self._ap_cone_escape_success = 0
-            self._ap_obs_cache = np.zeros((self.n_offensive, self._ap_obs_dim), dtype=np.float32)
             self._ap_prev_hvt_omega = np.zeros(self.n_offensive, dtype=np.float32)
-            self._ap_penetration_score = np.zeros(self.n_offensive, dtype=np.float32)
-            self._ap_team_penetration_score = 0.0
-            self._ap_attack_gate_reward = np.zeros(self.n_offensive, dtype=np.float32)
-            # V22: Decoy game + effective penetration per-episode state
             self._ap_prev_Phi_decoy = None
             self._ap_prev_N_eff = None
+
+        # V28: Reset analytic data caches
+        self._ap_decoy_info = {}
+        self._ap_pen_info = {}
+        self._ap_esc_info = {}
+        self._ap_hvt_info = {}
+        self._ap_Z_matrix = np.zeros((self.n_offensive, self.n_defensive), dtype=np.float32)
+        self._ap_Z_tilde = np.zeros(self.n_offensive, dtype=np.float32)
+        self._ap_psi_agg = np.zeros(self.n_offensive, dtype=np.float32)
+        self._ap_Gamma_matrix = [[0.0] * self.n_defensive for _ in range(self.n_offensive)]
+        self._ap_Xi_matrix = [[0.0] * self.n_defensive for _ in range(self.n_offensive)]
+        self._ap_prev_E_esc = None
+
+        # V36fix: Compute initial _ap_hvt_info so first obs is not all-zeros
+        if self._ap_enabled:
+            ap = self.config.get("analytic_priors", {})
+            pn_nav_gain = ap.get("pn_nav_gain", 3.0)
+            rho_list, closing_list, omega_list = [], [], []
+            omega_dot_list, pn_hint_list, P_hit_list = [], [], []
+            for i, off in enumerate(self.offensives):
+                if not off.alive or off.hit_hvt:
+                    rho_list.append(0.0); closing_list.append(0.0)
+                    omega_list.append(0.0); omega_dot_list.append(0.0)
+                    pn_hint_list.append(0.0); P_hit_list.append(0.0)
+                    continue
+                feats = compute_hvt_guidance_features(
+                    off, self.hvt, self.dt,
+                    prev_omega_los=self._ap_prev_hvt_omega[i],
+                    pn_nav_gain=pn_nav_gain)
+                self._ap_prev_hvt_omega[i] = feats["omega_los"]
+                rho_list.append(feats["rho"])
+                closing_list.append(feats["closing_speed"])
+                omega_list.append(feats["omega_los"])
+                omega_dot_list.append(feats["omega_los_dot"])
+                pn_hint_list.append(feats["pn_hint"])
+                P_hit_list.append(0.0)  # P_hit starts at 0 (far from target)
+            self._ap_hvt_info = {
+                "rho_per_agent": rho_list,
+                "closing_per_agent": closing_list,
+                "omega_per_agent": omega_list,
+                "omega_dot_per_agent": omega_dot_list,
+                "pn_hint_per_agent": pn_hint_list,
+                "P_hit_per_agent": P_hit_list,
+            }
 
         obs = self._get_obs()
         share_obs = self._get_share_obs()
@@ -299,6 +344,13 @@ class FOVPenetrationEnv:
     def step(self, actions):
         cfg = self.config
         self.current_step += 1
+
+        # 0. 保存上一步位置 (供CPA连续命中检测)
+        for off in self.offensives:
+            off._prev_pos = (off.x, off.y, off.z)
+        # V23: 也保存防御方前序位置 (供拦截器CPA双杀检测)
+        for d in self.defensives:
+            d._prev_pos = (d.x, d.y, d.z)
 
         # 1. 进攻方执行动作
         for i, off in enumerate(self.offensives):
@@ -310,8 +362,8 @@ class FOVPenetrationEnv:
         for i, policy in enumerate(self.defensive_policies):
             d = self.defensives[i]
             if d.alive:
-                nx, ny, nz = policy.get_action(self.offensives, self.dt)
-                d.step(nx, ny, nz, self.dt)
+                ax_cmd, ay_cmd, mu_cmd = policy.get_action(self.offensives, self.dt)
+                d.step(ax_cmd, ay_cmd, mu_cmd, self.dt)
 
         # 3. 更新探测状态
         self._update_detection()
@@ -352,10 +404,168 @@ class FOVPenetrationEnv:
                     if d_hvt < off.min_miss_distance:
                         off.min_miss_distance = d_hvt
 
-        # 8. 更新miss冷却
-        self._update_miss_cooldowns()
+        # 8. (V24: miss冷却已移除)
 
-        # 9. 奖励 — 传入逃逸事件
+        # 9. V28: 计算 analytic priors (供 reward 和 obs 使用)
+        ap_data = {}  # 传给 compute_rewards 的数据
+        ap_info = {}  # 日志信息
+        if self._ap_enabled:
+            ap = self.ap_config
+            self._ap_global_step += 1
+
+            # --- Module 1: Cone Cost → Z_matrix, Z_tilde, psi_agg ---
+            if ap.get("enable_cone_cost", False) and self._y_cache is not None:
+                cone_cost_val, cone_info, q_matrix = compute_group_cone_cost(
+                    self.offensives, self.defensives, cfg, ap,
+                    self._y_cache, self.current_step,
+                    prev_q_matrix=self._ap_prev_q_matrix)
+                self._ap_prev_q_matrix = q_matrix
+                Z_matrix = cone_info.pop("_Z_matrix", None)
+                if Z_matrix is not None:
+                    self._ap_Z_matrix = Z_matrix
+                Z_tilde_arr = cone_info.get("_Z_tilde", np.zeros(self.n_offensive))
+                psi_per_agent = cone_info.get("psi_agg_per_agent", [0.0] * self.n_offensive)
+                for i in range(self.n_offensive):
+                    self._ap_Z_tilde[i] = Z_tilde_arr[i] if i < len(Z_tilde_arr) else 0.0
+                    self._ap_psi_agg[i] = psi_per_agent[i] if i < len(psi_per_agent) else 0.0
+                ap_data["cone_cost_per_agent"] = list(self._ap_psi_agg)
+                ap_data["Z_tilde_per_agent"] = list(self._ap_Z_tilde)
+                ap_info.update(cone_info)
+            else:
+                ap_data["cone_cost_per_agent"] = [0.0] * self.n_offensive
+                ap_data["Z_tilde_per_agent"] = [0.0] * self.n_offensive
+
+            # --- Module 2: Decoy Game → U_decoy, role probs ---
+            if ap.get("enable_decoy_game", False):
+                # V29fix3: Save old Phi BEFORE computing new one
+                old_Phi_decoy = self._ap_prev_Phi_decoy
+                decoy_reward, per_agent_decoy, Phi_decoy, decoy_info = compute_decoy_game(
+                    self.offensives, self.defensives, self.hvt, cfg, ap,
+                    locked_by_map=self.locked_by_map,
+                    prev_Phi_decoy=old_Phi_decoy)
+                # Now update cache to new value
+                self._ap_prev_Phi_decoy = Phi_decoy
+                self._ap_decoy_info = decoy_info
+                ap_data["U_decoy_per_agent"] = decoy_info.get("U_decoy_per_agent", [0.0] * self.n_offensive)
+                ap_data["Phi_decoy"] = Phi_decoy
+                ap_data["prev_Phi_decoy"] = old_Phi_decoy if old_Phi_decoy is not None else Phi_decoy
+                ap_info.update(decoy_info)
+            else:
+                self._ap_decoy_info = {}
+                ap_data["U_decoy_per_agent"] = [0.0] * self.n_offensive
+
+            # --- Module 3a: LOS Escape → E_i_esc, Gamma, Xi matrices ---
+            if ap.get("enable_escape_reward", False):
+                escape_reward_val, per_agent_esc, escape_info = compute_escape_reward(
+                    self.offensives, self.defensives, cfg, ap)
+                self._ap_esc_info = escape_info
+                E_esc = escape_info.get("E_i_esc", [0.0] * self.n_offensive)
+                ap_data["E_esc_per_agent"] = E_esc
+                # Store prev for progress reward
+                ap_data["prev_E_esc_per_agent"] = self._ap_prev_E_esc
+                self._ap_prev_E_esc = list(E_esc)
+                # 存储 Gamma/Xi 矩阵 (per-pair)
+                Gamma_mat = escape_info.get("_Gamma_matrix", None)
+                Xi_mat = escape_info.get("_Xi_matrix", None)
+                if Gamma_mat is not None:
+                    self._ap_Gamma_matrix = Gamma_mat
+                if Xi_mat is not None:
+                    self._ap_Xi_matrix = Xi_mat
+                ap_info.update(escape_info)
+            else:
+                self._ap_esc_info = {"E_i_esc": [0.0] * self.n_offensive}
+                ap_data["E_esc_per_agent"] = [0.0] * self.n_offensive
+
+            # --- Module 3b: Effective Penetration → P_pen, N_eff ---
+            if ap.get("enable_effective_penetration", False):
+                _cone_risk = list(self._ap_psi_agg)
+                _lock_pressure = (self._ap_decoy_info.get(
+                    "lock_pressure_per_agent", [0.0] * self.n_offensive))
+                _locked_by_count = [len(self.locked_by_map.get(i, []))
+                                    for i in range(self.n_offensive)]
+                _E_i_esc = ap_data.get("E_esc_per_agent", [0.0] * self.n_offensive)
+
+                pen_reward, per_agent_pen, N_eff, pen_info = compute_effective_penetration(
+                    self.offensives, self.defensives, self.hvt, cfg, ap,
+                    cone_risk_per_agent=_cone_risk,
+                    lock_pressure_per_agent=_lock_pressure,
+                    locked_by_count_per_agent=_locked_by_count,
+                    E_i_esc_per_agent=_E_i_esc,
+                    prev_N_eff=self._ap_prev_N_eff)
+                self._ap_prev_N_eff = N_eff
+                self._ap_pen_info = pen_info
+                ap_data["P_pen_per_agent"] = pen_info.get("P_pen_per_agent", [0.0] * self.n_offensive)
+                ap_data["N_eff"] = N_eff
+                ap_info.update(pen_info)
+            else:
+                self._ap_pen_info = {}
+                ap_data["P_pen_per_agent"] = [0.0] * self.n_offensive
+
+            # --- Module 4: HVT Guidance → rho, closing, omega, omega_dot, pn_hint, P_hit ---
+            if ap.get("enable_hvt_guidance", False):
+                pn_nav_gain = ap.get("pn_nav_gain", 3.0)
+                rho_list = []
+                closing_list = []
+                omega_list = []
+                omega_dot_list = []
+                pn_hint_list = []
+                P_hit_list = []
+                for i, off in enumerate(self.offensives):
+                    if not off.alive or off.hit_hvt:
+                        rho_list.append(0.0)
+                        closing_list.append(0.0)
+                        omega_list.append(0.0)
+                        omega_dot_list.append(0.0)
+                        pn_hint_list.append(0.0)
+                        P_hit_list.append(0.0)
+                        continue
+                    feats = compute_hvt_guidance_features(
+                        off, self.hvt, self.dt,
+                        prev_omega_los=self._ap_prev_hvt_omega[i],
+                        pn_nav_gain=pn_nav_gain)
+                    self._ap_prev_hvt_omega[i] = feats["omega_los"]
+                    rho_list.append(feats["rho"])
+                    closing_list.append(feats["closing_speed"])
+                    omega_list.append(feats["omega_los"])
+                    omega_dot_list.append(feats["omega_los_dot"])
+                    pn_hint_list.append(feats["pn_hint"])
+
+                    # V29fix2: P_i_hit = sigma(kappa_h*(d_soft - rho)) * sigma(kappa_c*Vc) * sigma(-kappa_w*|omega|)
+                    # d_soft=10m (soft shaping), hard hit still 5m
+                    kappa_h = ap.get("kappa_h", 2.0)
+                    kappa_c = ap.get("kappa_c", 1.0)
+                    kappa_w = ap.get("kappa_omega", 2.0)
+                    d_soft = 10.0  # V29fix2: soft shaping radius, NOT rho/100
+                    from .reward_cost import _sigmoid as _sig
+                    p_hit = (_sig(kappa_h * (d_soft - feats["rho"]))
+                             * _sig(kappa_c * feats["closing_speed"])
+                             * _sig(-kappa_w * abs(feats["omega_los"])))
+                    P_hit_list.append(float(p_hit))
+
+                self._ap_hvt_info = {
+                    "rho_per_agent": rho_list,
+                    "closing_per_agent": closing_list,
+                    "omega_per_agent": omega_list,
+                    "omega_dot_per_agent": omega_dot_list,
+                    "pn_hint_per_agent": pn_hint_list,
+                    "P_hit_per_agent": P_hit_list,
+                }
+                ap_data["hvt_omega_los_per_agent"] = omega_list
+                ap_data["P_hit_per_agent"] = P_hit_list
+                self._ap_pen_info["P_hit_per_agent"] = P_hit_list
+                ap_info.update({
+                    "hvt_rho_mean": float(np.mean([r for r in rho_list if r > 0])) if any(r > 0 for r in rho_list) else 0.0,
+                    "hvt_closing_speed_mean": float(np.mean([c for c in closing_list if c != 0])) if any(c != 0 for c in closing_list) else 0.0,
+                })
+            else:
+                self._ap_hvt_info = {}
+                ap_data["hvt_omega_los_per_agent"] = [0.0] * self.n_offensive
+                ap_data["P_hit_per_agent"] = [0.0] * self.n_offensive
+
+            # 传入锁定映射
+            ap_data["locked_target_by_defender"] = dict(self.locked_target_by_defender)
+
+        # 10. V28: 奖励计算 — 使用新的 compute_rewards
         rewards_list, reward_info = compute_rewards(
             self.offensives, self.defensives, self.hvt, cfg,
             self.prev_dists_to_hvt, hit_events=step_hits,
@@ -365,7 +575,9 @@ class FOVPenetrationEnv:
             lock_on_map=self.lock_on_map,
             prev_team_min_dist=self.prev_team_min_dist,
             escape_events=step_escapes,
-            miss_events=step_misses)
+            miss_events=step_misses,
+            defensive_policies=self.defensive_policies,
+            ap_data=ap_data)
 
         # 更新prev状态
         cur_dists = []
@@ -380,319 +592,32 @@ class FOVPenetrationEnv:
             for off in self.offensives
         ]
 
-        # 10. 成本
+        # 10.5 V28: 成本已并入 reward, compute_costs 返回全零
         costs_list, cost_info = compute_costs(self.offensives, self.defensives, cfg)
-
-        # ====== 10.5 Analytic Priors: cone cost / mismatch reward / escape reward ======
-        ap_info = {}
-        if self._ap_enabled:
-            ap = self.ap_config
-            self._ap_global_step += 1
-
-            # --- Curriculum weight multiplier (only for reward shaping, NOT safety cost) ---
-            cur_mult = 1.0
-            if ap.get("curriculum_enabled", False):
-                total = ap.get("curriculum_total_steps", 10000000)
-                warmup = ap.get("curriculum_warmup_frac", 0.15)
-                warmup_steps = total * warmup
-                cur_mult = min(1.0, self._ap_global_step / max(warmup_steps, 1.0))
-                ap_info["curriculum_mult"] = cur_mult
-
-            # --- Module 1: Cone Cost (safety — always full weight, no curriculum) ---
-            cone_cost_val = 0.0
-            Z_matrix = None
-            psi_per_agent = None
-            if ap.get("enable_cone_cost", False) and self._y_cache is not None:
-                cone_cost_val, cone_info, q_matrix = compute_group_cone_cost(
-                    self.offensives, self.defensives, cfg, ap,
-                    self._y_cache, self.current_step,
-                    prev_q_matrix=self._ap_prev_q_matrix)
-                self._ap_prev_q_matrix = q_matrix
-                Z_matrix = cone_info.pop("_Z_matrix", None)
-                psi_per_agent = cone_info.get("psi_agg_per_agent", [])
-                w_cone = ap.get("cone_cost_weight", 1.0)  # NO curriculum on safety cost
-
-                # Enhancement: per-agent cone cost (each agent gets own risk)
-                if ap.get("per_agent_cone_cost", True) and psi_per_agent:
-                    for i, off in enumerate(self.offensives):
-                        if off.alive and i < len(psi_per_agent):
-                            costs_list[i] += psi_per_agent[i] * w_cone
-                else:
-                    n_alive = max(sum(1 for o in self.offensives if o.alive), 1)
-                    per_agent_cone = cone_cost_val * w_cone / n_alive
-                    for i, off in enumerate(self.offensives):
-                        if off.alive:
-                            costs_list[i] += per_agent_cone
-
-                # Cache for obs: Z_tilde_i, psi_agg_i
-                Z_tilde_arr = cone_info.get("_Z_tilde", np.zeros(self.n_offensive))
-                for i in range(self.n_offensive):
-                    self._ap_obs_cache[i, 0] = np.clip(Z_tilde_arr[i] if i < len(Z_tilde_arr) else 0.0, -5, 5) / 5.0
-                    self._ap_obs_cache[i, 1] = np.clip(psi_per_agent[i] if psi_per_agent and i < len(psi_per_agent) else 0.0, 0, 5) / 5.0
-                ap_info.update(cone_info)
-
-            # --- Module 2: Assignment Mismatch Reward ---
-            mismatch_reward_val = 0.0
-            if ap.get("enable_assignment_mismatch_reward", False):
-                mismatch_reward_val, M_tilde, mismatch_info = compute_assignment_mismatch(
-                    self.offensives, self.defensives, cfg, ap,
-                    self._ap_fixed_assignment,
-                    Z_matrix=Z_matrix,
-                    prev_M_tilde=self._ap_prev_M_tilde)
-                self._ap_prev_M_tilde = M_tilde
-                self._ap_episode_max_M_tilde = max(self._ap_episode_max_M_tilde, M_tilde)
-                w_mis = ap.get("mismatch_reward_weight", 0.3) * cur_mult
-                # actual delta already scaled by lambda_M inside, rescale by curriculum
-                scaled_mismatch = mismatch_reward_val * (cur_mult / max(ap.get("mismatch_reward_weight", 0.3), 1e-8)) * w_mis if ap.get("mismatch_reward_weight", 0.3) > 0 else 0.0
-
-                # Enhancement: cooperative mismatch — credit individual contribution
-                per_agent_contributions = mismatch_info.get("_per_agent_contribution", None)
-                if ap.get("cooperative_mismatch", True) and per_agent_contributions is not None and scaled_mismatch > 0:
-                    ind_w = ap.get("coop_mismatch_individual_weight", 0.6)
-                    team_w = 1.0 - ind_w
-                    n_alive = max(sum(1 for o in self.offensives if o.alive), 1)
-                    team_share = scaled_mismatch * team_w / n_alive
-                    total_contrib = sum(abs(c) for c in per_agent_contributions) + 1e-8
-                    for i, off in enumerate(self.offensives):
-                        if off.alive and i < len(per_agent_contributions):
-                            ind_share = scaled_mismatch * ind_w * abs(per_agent_contributions[i]) / total_contrib
-                            rewards_list[i] += ind_share + team_share
-                else:
-                    n_alive = max(sum(1 for o in self.offensives if o.alive), 1)
-                    per_agent_mis = scaled_mismatch / n_alive
-                    for i, off in enumerate(self.offensives):
-                        if off.alive:
-                            rewards_list[i] += per_agent_mis
-
-                # Cache for obs: M_tilde normalized
-                M_norm = np.clip(M_tilde / 50.0, 0, 1.0)  # normalize by empirical max
-                for i in range(self.n_offensive):
-                    self._ap_obs_cache[i, 2] = M_norm
-                ap_info.update(mismatch_info)
-
-            # --- Module 3: LOS Escape Reward ---
-            escape_reward_val = 0.0
-            if ap.get("enable_escape_reward", False):
-                escape_reward_val, per_agent_esc, escape_info = compute_escape_reward(
-                    self.offensives, self.defensives, cfg, ap)
-                w_esc = cur_mult  # already weighted inside by lambda_E
-                for i in range(len(self.offensives)):
-                    if self.offensives[i].alive:
-                        rewards_list[i] += per_agent_esc[i] * w_esc
-                # Cache for obs: Xi_max per agent
-                per_agent_xi = escape_info.get("_per_agent_Xi_max", None)
-                if per_agent_xi is not None:
-                    for i in range(min(len(per_agent_xi), self.n_offensive)):
-                        self._ap_obs_cache[i, 3] = np.clip(per_agent_xi[i], 0, 2) / 2.0
-                ap_info.update(escape_info)
-
-            # --- Module 2b: Decoy Game (V22 替代旧 Assignment Mismatch) ---
-            if ap.get("enable_decoy_game", False):
-                decoy_reward, per_agent_decoy, Phi_decoy, decoy_info = compute_decoy_game(
-                    self.offensives, self.defensives, self.hvt, cfg, ap,
-                    locked_by_map=self.locked_by_map,
-                    prev_Phi_decoy=self._ap_prev_Phi_decoy)
-                self._ap_prev_Phi_decoy = Phi_decoy
-
-                for i in range(self.n_offensive):
-                    if self.offensives[i].alive:
-                        rewards_list[i] += per_agent_decoy[i] * cur_mult
-                ap_info.update(decoy_info)
-
-            # --- Module 3b: Effective Penetration (V22) ---
-            if ap.get("enable_effective_penetration", False):
-                # 收集各模块的 per-agent 风险/能力值
-                _cone_risk = [self._ap_obs_cache[i, 1] * 5.0
-                              for i in range(self.n_offensive)]  # psi_agg_i (un-normalized)
-                _lock_pressure = (decoy_info.get("lock_pressure_per_agent", [0.0] * self.n_offensive)
-                                  if ap.get("enable_decoy_game", False)
-                                  else [0.0] * self.n_offensive)
-                _locked_by_count = [len(self.locked_by_map.get(i, []))
-                                    for i in range(self.n_offensive)]
-                _E_i_esc = (escape_info.get("E_i_esc", [0.0] * self.n_offensive)
-                            if ap.get("enable_escape_reward", False)
-                            else [0.0] * self.n_offensive)
-
-                pen_reward, per_agent_pen, N_eff, pen_info = compute_effective_penetration(
-                    self.offensives, self.defensives, self.hvt, cfg, ap,
-                    cone_risk_per_agent=_cone_risk,
-                    lock_pressure_per_agent=_lock_pressure,
-                    locked_by_count_per_agent=_locked_by_count,
-                    E_i_esc_per_agent=_E_i_esc,
-                    prev_N_eff=self._ap_prev_N_eff)
-                self._ap_prev_N_eff = N_eff
-
-                for i in range(self.n_offensive):
-                    if self.offensives[i].alive:
-                        rewards_list[i] += per_agent_pen[i] * cur_mult
-                ap_info.update(pen_info)
-
-            # --- Module 4: HVT Guidance + Soft Penetration Success Score ---
-            if ap.get("enable_hvt_guidance", False):
-                omega_ref = max(ap.get("hvt_omega_ref", 0.6), 1e-6)
-                omega_dot_ref = max(ap.get("hvt_omega_dot_ref", 0.8), 1e-6)
-                pn_hint_ref = max(ap.get("pn_hint_ref", 30.0), 1e-6)
-                pn_nav_gain = ap.get("pn_nav_gain", 3.0)
-                score_bias = ap.get("penetration_score_bias", -0.35)
-                score_scale = ap.get("penetration_score_scale", 2.2)
-
-                rho_values = []
-                closing_values = []
-                omega_values = []
-                omega_dot_values = []
-                pn_values = []
-                score_values = []
-
-                for i, off in enumerate(self.offensives):
-                    if not off.alive or off.hit_hvt:
-                        self._ap_penetration_score[i] = 0.0
-                        if self._ap_guidance_obs_dim > 0 and self._ap_obs_dim >= 10:
-                            self._ap_obs_cache[i, 4:10] = 0.0
-                        continue
-
-                    feats = compute_hvt_guidance_features(
-                        off, self.hvt, self.dt,
-                        prev_omega_los=self._ap_prev_hvt_omega[i],
-                        pn_nav_gain=pn_nav_gain,
-                    )
-                    self._ap_prev_hvt_omega[i] = feats["omega_los"]
-
-                    rho_norm = np.clip(feats["rho"] / max(cfg.get("obs_range", 5000.0), 1.0), 0.0, 1.0)
-                    closing_norm = np.clip(feats["closing_speed"] / max(cfg.get("vel_range", 120.0), 1.0), -1.0, 1.0)
-                    omega_norm = np.clip(feats["omega_los"] / omega_ref, 0.0, 1.0)
-                    omega_dot_norm = np.clip(feats["omega_los_dot"] / omega_dot_ref, -1.0, 1.0)
-                    pn_hint_norm = np.clip(feats["pn_hint"] / pn_hint_ref, -1.0, 1.0)
-
-                    cone_risk_norm = self._ap_obs_cache[i, 1] if self._ap_obs_dim >= 2 else 0.0
-                    mismatch_norm = self._ap_obs_cache[i, 2] if self._ap_obs_dim >= 3 else 0.0
-                    detected_norm = np.clip(
-                        off.detected_by_count / max(self.n_defensive, 1), 0.0, 1.0
-                    )
-
-                    pen_score = compute_penetration_success_score(
-                        rho_norm=rho_norm,
-                        closing_norm=closing_norm,
-                        omega_norm=omega_norm,
-                        omega_dot_norm=omega_dot_norm,
-                        pn_hint_norm=pn_hint_norm,
-                        cone_risk_norm=cone_risk_norm,
-                        mismatch_norm=mismatch_norm,
-                        detected_norm=detected_norm,
-                        score_bias=score_bias,
-                        score_scale=score_scale,
-                    )
-                    self._ap_penetration_score[i] = pen_score
-
-                    if self._ap_guidance_obs_dim > 0 and self._ap_obs_dim >= 10:
-                        self._ap_obs_cache[i, 4] = rho_norm
-                        self._ap_obs_cache[i, 5] = closing_norm
-                        self._ap_obs_cache[i, 6] = omega_norm
-                        self._ap_obs_cache[i, 7] = omega_dot_norm
-                        self._ap_obs_cache[i, 8] = pn_hint_norm
-                        self._ap_obs_cache[i, 9] = pen_score
-
-                    rho_values.append(feats["rho"])
-                    closing_values.append(feats["closing_speed"])
-                    omega_values.append(feats["omega_los"])
-                    omega_dot_values.append(feats["omega_los_dot"])
-                    pn_values.append(feats["pn_hint"])
-                    score_values.append(pen_score)
-
-                self._ap_team_penetration_score = float(np.mean(score_values)) if score_values else 0.0
-                ap_info.update({
-                    "penetration_success_score_mean": self._ap_team_penetration_score,
-                    "penetration_success_score_max": float(np.max(score_values)) if score_values else 0.0,
-                    "hvt_rho_mean": float(np.mean(rho_values)) if rho_values else 0.0,
-                    "hvt_closing_speed_mean": float(np.mean(closing_values)) if closing_values else 0.0,
-                    "hvt_omega_los_mean": float(np.mean(omega_values)) if omega_values else 0.0,
-                    "hvt_omega_los_dot_mean": float(np.mean(omega_dot_values)) if omega_dot_values else 0.0,
-                    "hvt_pn_hint_mean": float(np.mean(pn_values)) if pn_values else 0.0,
-                })
-
-                # --- Module 5: Attack Gate Reward (softly enabled by penetration score) ---
-                self._ap_attack_gate_reward[:] = 0.0
-                if ap.get("enable_attack_gate_reward", False):
-                    gate_weight = ap.get("attack_gate_weight", 3.0)
-                    w_prog = ap.get("attack_progress_weight", 1.0)
-                    w_closing = ap.get("attack_closing_weight", 0.8)
-                    w_los = ap.get("attack_los_weight", 0.5)
-                    w_losdot = ap.get("attack_losdot_weight", 0.4)
-                    w_pn = ap.get("attack_pn_align_weight", 0.6)
-                    pn_accel_ref_g = max(ap.get("pn_accel_ref_g", 8.0), 1e-6)
-
-                    gate_vals = []
-                    r_prog_vals = []
-                    r_closing_vals = []
-                    r_los_vals = []
-                    r_losdot_vals = []
-                    r_pn_vals = []
-
-                    for i, off in enumerate(self.offensives):
-                        if not off.alive or off.hit_hvt:
-                            continue
-
-                        rho_norm = self._ap_obs_cache[i, 4] if self._ap_obs_dim >= 10 else 1.0
-                        closing_norm = self._ap_obs_cache[i, 5] if self._ap_obs_dim >= 10 else 0.0
-                        omega_norm = self._ap_obs_cache[i, 6] if self._ap_obs_dim >= 10 else 0.0
-                        omega_dot_norm = self._ap_obs_cache[i, 7] if self._ap_obs_dim >= 10 else 0.0
-                        pn_hint_norm = self._ap_obs_cache[i, 8] if self._ap_obs_dim >= 10 else 0.0
-
-                        gate = float(np.clip(self._ap_penetration_score[i], 0.0, 1.0))
-
-                        progress_term = 1.0 - np.clip(rho_norm, 0.0, 1.0)
-                        closing_term = max(np.clip(closing_norm, -1.0, 1.0), 0.0)
-                        los_term = 1.0 - np.clip(omega_norm, 0.0, 1.0)
-                        losdot_term = 1.0 - min(abs(np.clip(omega_dot_norm, -1.0, 1.0)), 1.0)
-
-                        a_cmd_g = np.sqrt(off.ny ** 2 + (off.nz - np.cos(off.gamma)) ** 2)
-                        a_cmd_norm = np.clip(a_cmd_g / pn_accel_ref_g, 0.0, 1.0)
-                        pn_target = max(np.clip(pn_hint_norm, -1.0, 1.0), 0.0)
-                        pn_align_term = 1.0 - min(abs(a_cmd_norm - pn_target), 1.0)
-
-                        attack_reward = gate_weight * cur_mult * gate * (
-                            w_prog * progress_term
-                            + w_closing * closing_term
-                            + w_los * los_term
-                            + w_losdot * losdot_term
-                            + w_pn * pn_align_term
-                        )
-                        rewards_list[i] += attack_reward
-                        self._ap_attack_gate_reward[i] = attack_reward
-
-                        gate_vals.append(gate)
-                        r_prog_vals.append(progress_term)
-                        r_closing_vals.append(closing_term)
-                        r_los_vals.append(los_term)
-                        r_losdot_vals.append(losdot_term)
-                        r_pn_vals.append(pn_align_term)
-
-                    ap_info.update({
-                        "attack_gate_mean": float(np.mean(gate_vals)) if gate_vals else 0.0,
-                        "attack_reward_mean": float(np.mean(self._ap_attack_gate_reward)) if len(self._ap_attack_gate_reward) > 0 else 0.0,
-                        "attack_reward_sum": float(np.sum(self._ap_attack_gate_reward)),
-                        "attack_progress_term_mean": float(np.mean(r_prog_vals)) if r_prog_vals else 0.0,
-                        "attack_closing_term_mean": float(np.mean(r_closing_vals)) if r_closing_vals else 0.0,
-                        "attack_los_term_mean": float(np.mean(r_los_vals)) if r_los_vals else 0.0,
-                        "attack_losdot_term_mean": float(np.mean(r_losdot_vals)) if r_losdot_vals else 0.0,
-                        "attack_pn_align_term_mean": float(np.mean(r_pn_vals)) if r_pn_vals else 0.0,
-                    })
 
         # 11. 终止
         done, done_reason = self._check_done()
-        if done and done_reason == "timeout":
+
+        # V28: 终端奖励
+        if done:
+            terminal_rewards, terminal_info = compute_terminal_rewards(
+                self.offensives, self.hvt, cfg, ap_data=ap_data)
             for i in range(self.n_agents):
-                rewards_list[i] += cfg["reward"]["timeout_penalty"]
-            obs_range = max(cfg.get("obs_range", 5000.0), 1.0)
-            timeout_dist_coef = cfg["reward"].get("timeout_distance_penalty_coef", 0.0)
-            timeout_alive_pen = cfg["reward"].get("timeout_alive_penalty", 0.0)
-            if timeout_dist_coef != 0.0 or timeout_alive_pen != 0.0:
-                for i, off in enumerate(self.offensives):
-                    if not off.alive or off.hit_hvt:
-                        continue
-                    dist_hvt = off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z)
-                    dist_ratio = np.clip(dist_hvt / obs_range, 0.0, 2.0)
-                    rewards_list[i] -= timeout_dist_coef * dist_ratio
-                    rewards_list[i] += timeout_alive_pen
+                rewards_list[i] += terminal_rewards[i]
+            ap_info.update(terminal_info)
+
+            # timeout 额外按距离惩罚
+            if done_reason == "timeout":
+                for i in range(self.n_agents):
+                    rewards_list[i] += cfg["reward"]["timeout_penalty"]
+                timeout_dist_coef = cfg["reward"].get("timeout_distance_penalty_coef", 0.0)
+                if timeout_dist_coef != 0.0:
+                    for i, off in enumerate(self.offensives):
+                        if not off.alive or off.hit_hvt:
+                            continue
+                        dist_hvt = off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z)
+                        dist_ratio = np.clip(dist_hvt / max(cfg.get("obs_range", 2500.0), 1.0), 0.0, 2.0)
+                        rewards_list[i] -= timeout_dist_coef * dist_ratio
 
         # 12. 组装
         rewards = [[r] for r in rewards_list]
@@ -705,7 +630,12 @@ class FOVPenetrationEnv:
         first_det_steps = [o.first_detected_step for o in self.offensives if o.first_detected_step >= 0]
         first_det_avg = np.mean(first_det_steps) if first_det_steps else -1.0
         n_detected_now = sum(1 for o in self.offensives if o.alive and o.detected)
-        n_escaped = sum(1 for o in self.offensives if hasattr(o, '_n_escapes') and o._n_escapes > 0)
+        # V24: 计算每个进攻方吸引了多少拦截器
+        decoy_counts = []
+        for oi, off in enumerate(self.offensives):
+            n_chasers = sum(1 for dp in self.defensive_policies
+                           if dp.interceptor.alive and dp.target is off)
+            decoy_counts.append(n_chasers)
 
         two_stage = cfg["two_stage_eval"]
         if two_stage["enabled"]:
@@ -744,21 +674,16 @@ class FOVPenetrationEnv:
             "terminal_miss_distance_min": min(
                 (off.min_miss_distance for off in self.offensives),
                 default=float('inf')),
-            # 逃逸统计
-            "n_escapes_total": len(self.escape_events_total),
-            "n_escaped_agents": n_escaped,
-            "step_escapes": len(step_escapes),
-            "step_misses": len(step_misses),
-            "penetration_success_score_per_agent": self._ap_penetration_score.tolist(),
-            "penetration_success_score_team": float(self._ap_team_penetration_score),
-            "attack_gate_reward_per_agent": self._ap_attack_gate_reward.tolist(),
+            # 诱饵统计 (V24)
+            "decoy_counts_per_agent": decoy_counts,
+            "n_escapes_total": 0,
+            "n_escaped_agents": 0,
+            "step_escapes": 0,
+            "step_misses": 0,
         }
-        # Analytic priors info
-        if self._ap_enabled and ap_info:
+        # V28: Analytic priors info
+        if ap_info:
             info.update(ap_info)
-            if done:
-                info["ap_episode_max_M_tilde"] = self._ap_episode_max_M_tilde
-                info["ap_cone_escape_success"] = self._ap_cone_escape_success
         if done:
             info["bad_transition"] = (done_reason == "timeout")
             # V22: 终端统计 (youneedread 6.7)
@@ -791,55 +716,65 @@ class FOVPenetrationEnv:
 
     def _check_kills_escapes_and_hits(self):
         """
-        V22 核心: 击杀/逃逸/命中判定
+        V24 简化: 纯碰撞击杀 + HVT命中
 
-        击杀条件 (三级):
-          Level 1: 纯碰撞 (dist < collision_kill_range=8m) → 无条件双杀
-          Level 2: FOV跟踪击杀 (dist < kill_range=50m AND 连续FOV锁定N步) → 双杀
-          Level 3: miss (在杀伤区内但目标不在FOV → 目标逃脱)
+        击杀逻辑:
+          - CPA轨迹检测: 上步→本步线段最近距离 < collision_kill_range → 双杀
+          - 离散碰撞: 当前距离 < collision_kill_range → 双杀
 
-        逃逸条件:
-          - 拦截器锁定目标后, 目标突破了FOV → 逃逸事件
-          - 拦截器PN要求过载超出极限 → 自然产生FOV丢失 → 逃逸
-          - 拦截器放弃追击 → 逃逸
-
-        命中HVT (V22: 点目标):
-          - 进攻方到HVT距离 < 3m → 突防成功
+        命中HVT:
+          - 离散: dist < hit_hvt_range
+          - CPA连续: 线段最近点 < hit_hvt_range
         """
         cfg = self.config
-        fov_half = cfg["fov_half_angle"]
-        det_range = cfg["detection_range"]
-        kill_range = cfg.get("kill_range", 50.0)
-        collision_kill_range = cfg.get("collision_kill_range", 8.0)
-        fov_escape_cfg = cfg.get("fov_escape", {})
-        engagement_range = fov_escape_cfg.get("engagement_range", 200.0)
-        min_tracking_steps = fov_escape_cfg.get("min_tracking_steps", 3)
-        miss_cooldown_steps = fov_escape_cfg.get("miss_cooldown_steps", 50)
-        fov_escape_enabled = fov_escape_cfg.get("enabled", True)
+        collision_kill_range = cfg.get("collision_kill_range", 5.0)
 
         step_hits = []
-        step_escapes = []
+        step_escapes = []   # V24: 不再产生逃逸事件，保留接口兼容
         step_misses = []
 
         # ——————————————————————————————————
-        # A. 拦截器 vs 进攻方: 击杀/逃逸判定
+        # A. 拦截器 vs 进攻方: 碰撞击杀
         # ——————————————————————————————————
         for di, d in enumerate(self.defensives):
             if not d.alive:
                 continue
-            policy = self.defensive_policies[di]
 
             for oi, off in enumerate(self.offensives):
                 if not off.alive or off.hit_hvt:
                     continue
 
-                pair_key = (di, oi)
-                in_miss_cooldown = (pair_key in self.miss_cooldowns and
-                                    self.miss_cooldowns[pair_key] > 0)
-
                 dist = d.distance_3d(off)
 
-                # --- Level 1: 纯碰撞击杀 ---
+                # --- CPA轨迹检测 ---
+                if hasattr(d, '_prev_pos') and hasattr(off, '_prev_pos'):
+                    dx0, dy0, dz0 = d._prev_pos
+                    dx1, dy1, dz1 = d.x, d.y, d.z
+                    ox0, oy0, oz0 = off._prev_pos
+                    ox1, oy1, oz1 = off.x, off.y, off.z
+                    _cpa_hit = False
+                    for _t in [i * 0.1 for i in range(11)]:
+                        _pd = np.array([dx0 + _t*(dx1-dx0), dy0 + _t*(dy1-dy0), dz0 + _t*(dz1-dz0)])
+                        _po = np.array([ox0 + _t*(ox1-ox0), oy0 + _t*(oy1-oy0), oz0 + _t*(oz1-oz0)])
+                        if np.linalg.norm(_pd - _po) < collision_kill_range:
+                            _cpa_hit = True
+                            break
+                    if _cpa_hit and off.alive and d.alive:
+                        off.kill()
+                        d.kill()
+                        self.kill_events.append({
+                            "step": self.current_step,
+                            "defensive_id": d.uid,
+                            "offensive_id": off.uid,
+                            "mutual_kill": True,
+                            "type": "cpa_kill",
+                            "dist": dist,
+                        })
+                        break  # 该防御方已死
+
+                # --- 离散碰撞击杀 ---
+                if not d.alive:
+                    break
                 if dist < collision_kill_range:
                     off.kill()
                     d.kill()
@@ -852,129 +787,42 @@ class FOVPenetrationEnv:
                     })
                     break  # 该防御方已死
 
-                # --- Level 2 & 3: FOV跟踪击杀 / FOV逃逸 ---
-                if fov_escape_enabled and dist < kill_range:
-                    target_in_fov = d.is_in_fov(off.x, off.y, off.z,
-                                                fov_half, det_range)
-                    # 更新交战跟踪
-                    if pair_key not in self.engagement_tracking:
-                        self.engagement_tracking[pair_key] = 0
-
-                    if target_in_fov:
-                        self.engagement_tracking[pair_key] += 1
-                    else:
-                        # 目标不在FOV! → MISS/逃逸!
-                        prev_tracking = self.engagement_tracking.get(pair_key, 0)
-                        if (not in_miss_cooldown) and (prev_tracking > 0 or dist < kill_range * 0.8):
-                            # 之前有过锁定现在丢失, 或者很近但不在FOV = 逃逸
-                            escape_ev = {
-                                "off_idx": oi,
-                                "def_idx": di,
-                                "type": "fov_break",
-                                "step": self.current_step,
-                                "dist": dist,
-                                "prev_tracking": prev_tracking,
-                            }
-                            step_escapes.append(escape_ev)
-                            self.escape_events_total.append(escape_ev)
-                            off._escaped_interceptor = True
-                            off._n_escapes += 1
-
-                            # 拦截器标记miss
-                            policy.mark_target_missed(oi)
-                            self.miss_cooldowns[pair_key] = miss_cooldown_steps
-                            step_misses.append({
-                                "off_idx": oi,
-                                "def_idx": di,
-                                "reason": "fov_break",
-                            })
-
-                        self.engagement_tracking[pair_key] = 0
-
-                elif fov_escape_enabled and dist < engagement_range:
-                    # 在交战区但未进入杀伤区 — 跟踪是否能保持FOV
-                    target_in_fov = d.is_in_fov(off.x, off.y, off.z,
-                                                fov_half, det_range)
-                    if pair_key not in self.engagement_tracking:
-                        self.engagement_tracking[pair_key] = 0
-
-                    if target_in_fov:
-                        self.engagement_tracking[pair_key] += 1
-                    else:
-                        # 在交战区丢失FOV — 检查拦截器是否过载饱和
-                        sat_ny, sat_nz, sat_ratio = policy.is_overload_saturated()
-                        if (not in_miss_cooldown) and (sat_ny or sat_nz):
-                            # ★ 过载饱和导致的FOV丢失 = 逃逸! ★
-                            escape_ev = {
-                                "off_idx": oi,
-                                "def_idx": di,
-                                "type": "overload_escape",
-                                "step": self.current_step,
-                                "dist": dist,
-                                "saturation_ratio": sat_ratio,
-                                "demanded_ny": policy.demanded_ny,
-                                "demanded_nz": policy.demanded_nz,
-                            }
-                            step_escapes.append(escape_ev)
-                            self.escape_events_total.append(escape_ev)
-                            off._escaped_interceptor = True
-                            off._n_escapes += 1
-
-                            policy.mark_target_missed(oi)
-                            self.miss_cooldowns[pair_key] = miss_cooldown_steps
-                            step_misses.append({
-                                "off_idx": oi,
-                                "def_idx": di,
-                                "reason": "overload_saturation",
-                                "sat_ratio": sat_ratio,
-                            })
-
-                        self.engagement_tracking[pair_key] = 0
-
-                # 非FOV逃逸模式下，不进行非碰撞击杀（仅保留Level 1碰撞击杀）
-
-            # 检查拦截器是否因前向限制放弃了目标 → 也算逃逸
-            if (d.alive and
-                policy.engagement_state in (InterceptorPolicy.STATE_ABANDONED,
-                                            InterceptorPolicy.STATE_MISSED)):
-                off_idx = policy.assigned_target_idx
-                if off_idx is not None and 0 <= off_idx < self.n_offensive:
-                    off = self.offensives[off_idx]
-                    if off.alive and not off.hit_hvt:
-                        # 检查是否已记录过该逃逸
-                        pair_key = (di, off_idx)
-                        if pair_key not in self.miss_cooldowns:
-                            if policy.engagement_state == InterceptorPolicy.STATE_ABANDONED:
-                                escape_ev = {
-                                    "off_idx": off_idx,
-                                    "def_idx": di,
-                                    "type": "pass_through",
-                                    "step": self.current_step,
-                                }
-                                step_escapes.append(escape_ev)
-                                self.escape_events_total.append(escape_ev)
-                                off._escaped_interceptor = True
-                                off._n_escapes += 1
-                            self.miss_cooldowns[pair_key] = miss_cooldown_steps
-                            step_misses.append({
-                                "off_idx": off_idx,
-                                "def_idx": di,
-                                "reason": "forward_pass",
-                            })
-
         # ——————————————————————————————————
-        # B. 命中HVT判定 (V22: 点目标, 3m)
+        # B. 命中HVT判定 (V22fix: CPA连续检测 + 离散检测)
         # ——————————————————————————————————
-        hvt_range = cfg.get("hit_hvt_range", 3.0)
+        hvt_range = cfg.get("point_target", {}).get("hit_threshold", 5.0)  # V29fix1: 唯一权威字段
+        hx, hy, hz = self.hvt.x, self.hvt.y, self.hvt.z
         for i, off in enumerate(self.offensives):
             if not off.alive or off.hit_hvt:
                 continue
-            if off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z) < hvt_range:
+            # 离散位置检测
+            dist_now = off.distance_to(hx, hy, hz)
+            if dist_now < hvt_range:
                 off.mark_hit_hvt()
                 off.hit_time = self.current_step
                 self.hit_count += 1
                 self.hit_indices.append(i)
                 step_hits.append(i)
+                continue
+            # CPA连续检测: 上一步位置→当前位置线段上最近点
+            if hasattr(off, '_prev_pos'):
+                px, py, pz = off._prev_pos
+                dx, dy, dz = off.x - px, off.y - py, off.z - pz
+                seg_len_sq = dx*dx + dy*dy + dz*dz
+                if seg_len_sq > 1e-6:
+                    t = max(0.0, min(1.0, (
+                        (hx - px)*dx + (hy - py)*dy + (hz - pz)*dz
+                    ) / seg_len_sq))
+                    cx = px + t*dx
+                    cy = py + t*dy
+                    cz = pz + t*dz
+                    cpa_dist = np.sqrt((cx-hx)**2 + (cy-hy)**2 + (cz-hz)**2)
+                    if cpa_dist < hvt_range:
+                        off.mark_hit_hvt()
+                        off.hit_time = self.current_step
+                        self.hit_count += 1
+                        self.hit_indices.append(i)
+                        step_hits.append(i)
 
         return step_hits, step_escapes, step_misses
 
@@ -1011,192 +859,264 @@ class FOVPenetrationEnv:
 
     def _get_obs(self):
         """
-        V22 观测空间 — 增加锁定态势
-        新增维度:
-          - 防御方: overload饱和度, 锁定状态(LOCKED与否)
-          - 队友: escaped状态
-          - 协同: 已逃脱拦截器数
+        V35 观测空间 — "目标优先" (Target-First) 总维度 37
+
+        设计理念: 打击目标是首要信息, HVT相关obs放在最前面最显著位置
+        让飞行器知道: 队友在吸引火力 → 自己应该专心突入
+
+        1. Self State (10):
+           self_rel_goal_x/y/z, self_speed, self_heading, self_gamma,
+           self_ax, self_ay, is_locked, locked_by_count
+
+        2. HVT Target Guidance (8) — V35扩展:
+           rho_to_hvt, closing_speed_to_hvt, omega_hvt_los,
+           omega_hvt_los_dot, pn_hint_to_hvt,
+           heading_error_to_hvt,     # 新增: 机头朝向与目标方向的夹角
+           distance_progress,        # 新增: 当前距离/初始距离 (进度指标)
+           teammates_drawing_fire    # 新增: 有多少队友正在吸引拦截器火力
+
+        3. Top-2 Threat Interceptors (6*2=12) — V35精简:
+           每个: rho, closing_speed, bearing_error, in_fov, is_locking_me,
+                 omega_los  (去掉Gamma/Xi/Z, 太抽象agent学不到)
+
+        4. Team Situation (4) — V35精简:
+           n_teammates_locked, n_teammates_free,
+           team_effective_penetration_score,
+           n_alive_ratio
+
+        5. Target Priority (2):
+           P_pen_i, P_hit_i  (仅保留最重要的两个)
+
+        6. Time (1):
+           time_ratio
         """
         cfg = self.config
-        obs_range = cfg["obs_range"]
-        vel_range = cfg["vel_range"]
-        z_range = cfg["z_range"]
+        obs_range = max(cfg["obs_range"], 1.0)
+        vel_range = max(cfg["vel_range"], 1.0)
+        z_range = max(cfg.get("z_range", 1000.0), 1.0)
+        fov_half = cfg["fov_half_angle"]
+        det_range = cfg["detection_range"]
 
         hvt_x, hvt_y, hvt_z = self.hvt.x, self.hvt.y, self.hvt.z
-        dists_to_hvt = []
-        front_scores = []
-        for off in self.offensives:
-            if off.alive and not off.hit_hvt:
-                d = off.distance_to(hvt_x, hvt_y, hvt_z)
-                dists_to_hvt.append(d)
-                front_scores.append(d)
-            else:
-                dists_to_hvt.append(float('inf'))
-                front_scores.append(float('inf'))
 
-        sorted_by_front = sorted(range(self.n_offensive), key=lambda i: front_scores[i])
-        front_rank = [0] * self.n_offensive
-        for rank, idx in enumerate(sorted_by_front):
-            front_rank[idx] = rank
-
-        alive_dists = [d for d in dists_to_hvt if d < float('inf')]
-        team_min_dist = min(alive_dists) if alive_dists else float('inf')
-        def_alive_ratio = sum(1 for d in self.defensives if d.alive) / max(self.n_defensive, 1)
-
-        # V22: 已逃脱拦截器的进攻方数量
-        n_escaped_agents = sum(1 for o in self.offensives
-                              if hasattr(o, '_n_escapes') and o._n_escapes > 0 and o.alive)
+        # 预计算
+        decoy_info = self._ap_decoy_info
+        pen_info = self._ap_pen_info
+        esc_info = self._ap_esc_info
+        hvt_info = self._ap_hvt_info
 
         obs_list = []
         for ai, agent in enumerate(self.offensives):
             obs = []
-            # === 自身状态 (9) ===
+
+            # ============================================
+            # 1. Self State (10)
+            # ============================================
+            rel_x = (hvt_x - agent.x) / obs_range
+            rel_y = (hvt_y - agent.y) / obs_range
+            rel_z = (hvt_z - agent.z) / z_range
             obs.extend([
-                agent.x / obs_range, agent.y / obs_range, agent.z / z_range,
-                agent.v / vel_range, agent.heading / np.pi,
-                agent.gamma / (np.pi / 4),
-                agent.nx / 4.0, agent.ny / 5.0, agent.nz / 3.0,
+                rel_x,              # self_rel_goal_x
+                rel_y,              # self_rel_goal_y
+                rel_z,              # self_rel_goal_z
+                agent.v / vel_range,             # self_speed
+                agent.heading / np.pi,           # self_heading
+                agent.gamma / (np.pi / 4),       # self_gamma
+                agent.ax / 20.0,                 # self_ax
+                agent.ay / 25.0,                 # self_ay
+                1.0 if agent.locked_by_count > 0 else 0.0,  # is_locked
+                agent.locked_by_count / max(self.n_defensive, 1),  # locked_by_count
             ])
-            # === HVT相对位置 (3) ===
-            obs.extend([
-                (hvt_x - agent.x) / obs_range,
-                (hvt_y - agent.y) / obs_range,
-                (hvt_z - agent.z) / z_range,
-            ])
-            # === 防御方信息 (11*K) ===
-            if agent.alive:
-                def_dists = []
-                for di, d in enumerate(self.defensives):
-                    dd = d.distance_3d(agent) if d.alive else float('inf')
-                    def_dists.append((dd, di))
-                def_dists.sort()
-                for k in range(self.obs_k_def):
-                    if k < len(def_dists) and def_dists[k][0] < float('inf'):
-                        d = self.defensives[def_dists[k][1]]
-                        di_idx = def_dists[k][1]
-                        obs.extend([
-                            (d.x - agent.x) / obs_range,
-                            (d.y - agent.y) / obs_range,
-                            (d.z - agent.z) / z_range,
-                            (d.v - agent.v) / vel_range,
-                            (d.heading - agent.heading) / np.pi,
-                            (d.gamma - agent.gamma) / (np.pi / 4),
-                            1.0,
-                        ])
-                        # threat_heading
-                        dx_me = agent.x - d.x
-                        dy_me = agent.y - d.y
-                        angle_to_me = np.arctan2(dy_me, dx_me)
-                        heading_diff = angle_to_me - d.heading
-                        heading_diff = np.arctan2(np.sin(heading_diff), np.cos(heading_diff))
-                        threat_heading = np.cos(heading_diff)
-                        obs.append(threat_heading)
 
-                        # closing_speed
-                        dist_d = max(def_dists[k][0], 1.0)
-                        cos_gd = np.cos(d.gamma)
-                        vx_d = d.v * cos_gd * np.cos(d.heading)
-                        vy_d = d.v * cos_gd * np.sin(d.heading)
-                        vz_d = d.v * np.sin(d.gamma)
-                        cos_ga = np.cos(agent.gamma)
-                        vx_a = agent.v * cos_ga * np.cos(agent.heading)
-                        vy_a = agent.v * cos_ga * np.sin(agent.heading)
-                        vz_a = agent.v * np.sin(agent.gamma)
-                        rdx = agent.x - d.x
-                        rdy = agent.y - d.y
-                        rdz = agent.z - d.z
-                        closing_v = -((rdx*(vx_a-vx_d) + rdy*(vy_a-vy_d) + rdz*(vz_a-vz_d)) / dist_d)
-                        obs.append(np.clip(closing_v / vel_range, -1.0, 1.0))
+            # ============================================
+            # 2. HVT Target Guidance (8) — V35扩展
+            # ============================================
+            rho_hvt = hvt_info.get("rho_per_agent", [0.0] * self.n_offensive)[ai]
+            closing_hvt = hvt_info.get("closing_per_agent", [0.0] * self.n_offensive)[ai]
+            omega_hvt = hvt_info.get("omega_per_agent", [0.0] * self.n_offensive)[ai]
+            omega_dot_hvt = hvt_info.get("omega_dot_per_agent", [0.0] * self.n_offensive)[ai]
+            pn_hint_hvt = hvt_info.get("pn_hint_per_agent", [0.0] * self.n_offensive)[ai]
 
-                        # V22: 拦截器过载饱和度
-                        policy = self.defensive_policies[di_idx]
-                        _, _, sat_ratio = policy.is_overload_saturated()
-                        obs.append(np.clip(sat_ratio, 0.0, 3.0) / 3.0)
+            # V35新增: heading_error_to_hvt — 机头朝向与目标连线的夹角
+            dx = hvt_x - agent.x
+            dy = hvt_y - agent.y
+            bearing_to_hvt = np.arctan2(dy, dx)
+            heading_error = bearing_to_hvt - agent.heading
+            # 归一化到 [-pi, pi]
+            heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
 
-                        # V22: 是否处于LOCKED状态 (0或1)
-                        is_locked = 1.0 if (policy.lock_mode ==
-                                            InterceptorPolicy.STATE_LOCKED) else 0.0
-                        obs.append(is_locked)
-                    else:
-                        obs.extend([0.0] * 11)
+            # V35新增: distance_progress — 当前距离占初始距离的比例
+            init_dist_estimate = obs_range  # 初始通常在obs_range附近
+            # V36fix: rho_hvt=0 means dead/hit, use actual distance for alive agents
+            if rho_hvt > 0:
+                dist_progress = rho_hvt / init_dist_estimate
+            elif agent.alive and not agent.hit_hvt:
+                # Fallback: compute directly (handles first step if hvt_info incomplete)
+                dist_progress = agent.distance_to(hvt_x, hvt_y, hvt_z) / init_dist_estimate
             else:
-                obs.extend([0.0] * (11 * self.obs_k_def))
+                dist_progress = 0.0  # dead/hit → distance irrelevant
 
-            # === 队友信息 (10*(n_off-1)) ===
-            for aj, teammate in enumerate(self.offensives):
-                if aj == ai:
+            # V35新增: teammates_drawing_fire — 正在吸引拦截器的队友数量
+            n_mates_drawing_fire = 0
+            for k, other in enumerate(self.offensives):
+                if k == ai or not other.alive or other.hit_hvt:
                     continue
-                if teammate.alive and agent.alive:
-                    obs.extend([
-                        (teammate.x - agent.x) / obs_range,
-                        (teammate.y - agent.y) / obs_range,
-                        (teammate.z - agent.z) / z_range,
-                        teammate.v / vel_range,
-                        teammate.heading / np.pi,
-                        teammate.gamma / (np.pi / 4),
-                        1.0,
-                    ])
-                    mate_dist = dists_to_hvt[aj] / obs_range if dists_to_hvt[aj] < float('inf') else 1.0
-                    obs.append(mate_dist)
-                    obs.append(front_rank[aj] / max(self.n_offensive - 1, 1))
-                    # V22: 队友是否已逃脱过拦截器
-                    obs.append(1.0 if (hasattr(teammate, '_escaped_interceptor')
-                                       and teammate._escaped_interceptor) else 0.0)
+                if other.locked_by_count > 0:
+                    n_mates_drawing_fire += 1
+
+            obs.extend([
+                np.clip(rho_hvt / obs_range, 0.0, 2.0),      # 到HVT距离
+                np.clip(closing_hvt / vel_range, -1.0, 1.0),  # 闭合速度
+                np.clip(omega_hvt / 0.5, -1.0, 1.0),          # LOS角速度
+                np.clip(omega_dot_hvt / 0.8, -1.0, 1.0),      # LOS角加速度
+                np.clip(pn_hint_hvt / 30.0, -1.0, 1.0),       # PN制导提示
+                heading_error / np.pi,                          # V35: 航向偏差 [-1,1]
+                np.clip(dist_progress, 0.0, 2.0),              # V35: 距离进度
+                n_mates_drawing_fire / max(self.n_offensive - 1, 1),  # V35: 队友吸引火力
+            ])
+
+            # ============================================
+            # 3. Top-2 Threat Interceptors (6*2=12) — V35精简
+            # ============================================
+            threat_scores = self._compute_threat_scores(ai, agent)
+            threat_scores.sort(key=lambda x: -x[0])
+
+            for k in range(self._n_top_threats):
+                if k < len(threat_scores) and threat_scores[k][0] > -100:
+                    _, di = threat_scores[k]
+                    d = self.defensives[di]
+                    if d.alive and agent.alive:
+                        rho_ij = agent.distance_3d(d)
+                        v_off = self._vel3d(agent)
+                        v_def = self._vel3d(d)
+                        r_ij = np.array([agent.x - d.x, agent.y - d.y, agent.z - d.z])
+                        rho_safe = max(rho_ij, 1e-3)
+                        vc_ij = float(-np.dot(r_ij, v_off - v_def) / rho_safe)
+
+                        cg = np.cos(d.gamma)
+                        b_j = np.array([cg * np.cos(d.heading),
+                                        cg * np.sin(d.heading),
+                                        np.sin(d.gamma)])
+                        cos_theta = np.clip(np.dot(b_j, r_ij) / rho_safe, -1.0, 1.0)
+                        theta_ij = np.arccos(cos_theta)
+                        bearing_error = theta_ij - fov_half
+                        q_ij = cos_theta - np.cos(fov_half)
+                        in_fov = 1.0 if q_ij > 0 else 0.0
+
+                        policy = self.defensive_policies[di]
+                        is_locking = 1.0 if (policy.lock_mode == InterceptorPolicy.STATE_LOCKED
+                                             and policy.current_locked_target_idx == ai) else 0.0
+
+                        cross = np.cross(r_ij, v_off - v_def)
+                        omega_los_ij = float(np.linalg.norm(cross) / max(rho_safe ** 2, 1e-6))
+
+                        obs.extend([
+                            np.clip(rho_ij / obs_range, 0.0, 2.0),
+                            np.clip(vc_ij / vel_range, -1.0, 1.0),
+                            np.clip(bearing_error / np.pi, -1.0, 1.0),
+                            in_fov,
+                            is_locking,
+                            np.clip(omega_los_ij / 0.5, 0.0, 2.0),
+                        ])
+                    else:
+                        obs.extend([0.0] * self._dim_per_threat)
                 else:
-                    obs.extend([0.0] * 10)
+                    obs.extend([0.0] * self._dim_per_threat)
 
-            # === 暴露状态 (3) ===
-            obs.append(1.0 if agent.detected else 0.0)
-            obs.append(agent.detected_by_count / max(self.n_defensive, 1))
-            obs.append(min(agent.continuous_exposure / 50.0, 1.0))
+            # ============================================
+            # 4. Team Situation (4) — V35精简
+            # ============================================
+            n_mates_locked = 0
+            n_mates_free = 0
+            n_alive = 0
+            for k, other in enumerate(self.offensives):
+                if k == ai or not other.alive or other.hit_hvt:
+                    continue
+                n_alive += 1
+                if other.locked_by_count > 0:
+                    n_mates_locked += 1
+                else:
+                    n_mates_free += 1
 
-            # === 全局信息 (2) ===
-            dist_hvt_norm = dists_to_hvt[ai] / obs_range if dists_to_hvt[ai] < float('inf') else 1.0
-            obs.append(dist_hvt_norm)
+            team_pen_score = pen_info.get("N_eff", 0.0)
+
+            obs.extend([
+                n_mates_locked / max(self.n_offensive - 1, 1),
+                n_mates_free / max(self.n_offensive - 1, 1),
+                np.clip(team_pen_score / max(self.n_offensive, 1), 0.0, 1.0),
+                (n_alive + 1) / self.n_offensive,  # 包括自己的存活比
+            ])
+
+            # ============================================
+            # 5. Target Priority (2) — V35精简
+            # ============================================
+            P_pen_i = pen_info.get("P_pen_per_agent", [0.0] * self.n_offensive)[ai]
+            P_hit_i = pen_info.get("P_hit_per_agent", [0.0] * self.n_offensive)[ai]
+            obs.extend([
+                np.clip(P_pen_i, 0.0, 1.0),
+                np.clip(P_hit_i, 0.0, 1.0),
+            ])
+
+            # ============================================
+            # 6. Time (1)
+            # ============================================
             obs.append(self.current_step / self.max_steps)
-
-            # === 协同态势 (5) ===
-            obs.append(front_rank[ai] / max(self.n_offensive - 1, 1))
-
-            n_threats = 0
-            if agent.alive:
-                for d in self.defensives:
-                    if not d.alive:
-                        continue
-                    dx_me = agent.x - d.x
-                    dy_me = agent.y - d.y
-                    angle_to_me = np.arctan2(dy_me, dx_me)
-                    hdiff = angle_to_me - d.heading
-                    hdiff = np.arctan2(np.sin(hdiff), np.cos(hdiff))
-                    if abs(hdiff) < np.deg2rad(30.0) and d.distance_3d(agent) < 3000.0:
-                        n_threats += 1
-            obs.append(n_threats / max(self.n_defensive, 1))
-
-            obs.append(team_min_dist / obs_range if team_min_dist < float('inf') else 1.0)
-            obs.append(def_alive_ratio)
-
-            # V22: 全队已逃脱拦截器的数量(归一化)
-            obs.append(n_escaped_agents / max(self.n_offensive, 1))
-
-            # === 解析先验观测 (base4 + optional6 guidance dims) ===
-            if self._ap_obs_dim > 0:
-                obs.extend(self._ap_obs_cache[ai].tolist())
 
             obs_list.append(np.array(obs, dtype=np.float32))
         return obs_list
 
+    @staticmethod
+    def _vel3d(entity):
+        """3D velocity vector"""
+        cg = np.cos(entity.gamma)
+        return np.array([entity.v * cg * np.cos(entity.heading),
+                         entity.v * cg * np.sin(entity.heading),
+                         entity.v * np.sin(entity.gamma)])
+
+    def _compute_threat_scores(self, ai, agent):
+        """计算每个拦截器对进攻方 ai 的威胁分数, 用于选 Top-2"""
+        if not agent.alive:
+            return []
+        lambda_rho = 1.0
+        lambda_q = 1.0
+        lambda_L = 2.0
+        fov_half = self.config["fov_half_angle"]
+        scores = []
+        for di, d in enumerate(self.defensives):
+            if not d.alive:
+                scores.append((-1000.0, di))
+                continue
+            rho = agent.distance_3d(d)
+            # (1) 距离越近越危险
+            dist_score = lambda_rho / (rho + 1.0)
+            # (2) 在 FOV 内更危险
+            r_ij = np.array([agent.x - d.x, agent.y - d.y, agent.z - d.z])
+            rho_safe = max(rho, 1e-3)
+            cg = np.cos(d.gamma)
+            b_j = np.array([cg * np.cos(d.heading), cg * np.sin(d.heading), np.sin(d.gamma)])
+            q_ij = np.dot(b_j, r_ij) / rho_safe - np.cos(fov_half)
+            fov_score = lambda_q * max(q_ij, 0.0)
+            # (3) 锁定我 → 高危
+            policy = self.defensive_policies[di]
+            lock_score = lambda_L if (policy.lock_mode == InterceptorPolicy.STATE_LOCKED
+                                      and policy.current_locked_target_idx == ai) else 0.0
+            total = dist_score + fov_score + lock_score
+            scores.append((total, di))
+        return scores
+
     def _get_share_obs(self):
+        """V28 共享观测: 全局完整状态"""
         cfg = self.config
-        obs_range = cfg["obs_range"]
-        vel_range = cfg["vel_range"]
-        z_range = cfg["z_range"]
+        obs_range = max(cfg["obs_range"], 1.0)
+        vel_range = max(cfg["vel_range"], 1.0)
+        z_range = max(cfg.get("z_range", 1000.0), 1.0)
         so = []
         for off in self.offensives:
             so.extend([
                 off.x / obs_range, off.y / obs_range, off.z / z_range,
                 off.v / vel_range, off.heading / np.pi,
                 off.gamma / (np.pi / 4),
-                off.nx / 4.0, off.ny / 5.0, off.nz / 3.0,
+                off.ax / 20.0, off.ay / 25.0, off.mu / np.pi,
                 float(off.alive),
             ])
         for d in self.defensives:
@@ -1217,8 +1137,10 @@ class FOVPenetrationEnv:
         so.extend([min_dist, n_det / max(self.n_offensive, 1),
                     off_alive_ratio, def_alive_ratio,
                     self.current_step / self.max_steps])
-        if self._ap_share_extra_dim > 0:
-            so.append(float(self._ap_team_penetration_score))
+        # team penetration score
+        pen_info = self._ap_pen_info
+        team_pen = pen_info.get("N_eff", 0.0)
+        so.append(float(np.clip(team_pen / max(self.n_offensive, 1), 0.0, 1.0)))
         so_array = np.array(so, dtype=np.float32)
         return [so_array.copy() for _ in range(self.n_agents)]
 

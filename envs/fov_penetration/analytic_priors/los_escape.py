@@ -100,26 +100,25 @@ def compute_escape_margin(
     if rho < 1e-3:
         return 0.0
 
-    # Attacker's current commanded acceleration
-    # ny and nz produce lateral and vertical forces
-    # We approximate the full 3D acceleration from overload
-    a_x = off.nx * G  # along velocity direction (approx)
-    # Lateral acceleration in body frame → need to project to inertial
+    # V4动力学: 从 (ax, ay, mu) 重建惯性系加速度
+    # ay*cos(mu): 水平法向加速度 (causing heading change)
+    # ay*sin(mu) - g*cos(gamma): 垂直法向加速度 (net, causing gamma change)
     cg = np.cos(off.gamma)
     sh = np.sin(off.heading)
     ch = np.cos(off.heading)
     sg = np.sin(off.gamma)
 
-    # Body-frame lateral accel (ny*g) → perpendicular to velocity in XY plane
-    # Rotated 90deg from heading
-    a_lat_x = -off.ny * G * sh
-    a_lat_y = off.ny * G * ch
+    # 水平法向加速度 → 垂直于速度方向在XY平面内 (旋转90°)
+    a_horiz = off.ay * np.cos(off.mu)
+    a_lat_x = -a_horiz * sh
+    a_lat_y = a_horiz * ch
     a_lat_z = 0.0
 
-    # Body-frame vertical accel  (nz - cos(gamma))*g  → perpendicular to velocity in vertical plane
-    a_vert_x = -(off.nz - np.cos(off.gamma)) * G * sg * ch
-    a_vert_y = -(off.nz - np.cos(off.gamma)) * G * sg * sh
-    a_vert_z = (off.nz - np.cos(off.gamma)) * G * cg
+    # 垂直法向加速度 (扣除重力补偿, 仅保留机动分量)
+    a_vert_net = off.ay * np.sin(off.mu) - G * np.cos(off.gamma)
+    a_vert_x = -a_vert_net * sg * ch
+    a_vert_y = -a_vert_net * sg * sh
+    a_vert_z = a_vert_net * cg
 
     a_cmd = np.array([a_lat_x + a_vert_x,
                       a_lat_y + a_vert_y,

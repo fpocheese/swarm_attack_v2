@@ -87,13 +87,9 @@ def compute_Z_ij(q_ij: float, q_dot_ij: float, t_go: float,
 def compute_equivalent_normal_accel(entity) -> float:
     """Approximate equivalent normal acceleration magnitude (m/s^2).
 
-    Uses the entity's current lateral (ny) and vertical (nz) overload.
-    For nz: subtract gravity component (nz is load factor where nz=1 = level).
+    V4动力学: entity.ay 即为法向加速度大小, 直接返回。
     """
-    ny_g = entity.ny * G
-    # nz includes gravity compensation: actual vertical accel = (nz - cos(gamma))*g
-    nz_corrected = (entity.nz - np.cos(entity.gamma)) * G
-    return np.sqrt(ny_g ** 2 + nz_corrected ** 2)
+    return entity.ay
 
 
 # -----------------------------------------------------------------------

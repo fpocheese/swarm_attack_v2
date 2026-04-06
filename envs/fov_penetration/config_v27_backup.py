@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     "z_min": 0.0,                # V23: 100→0m (打击地面目标不能在100m判死)
     "z_max": 1000.0,             # V23: 2000→1000m
     "dt": 0.01,                  # V23: 0.05→0.01s (步长0.5m，防止飞过目标)
-    "max_steps": 8000,           # V36: 6000→8000 (dt=0.01×8000=80s, 给机动留余量)
+    "max_steps": 8000,           # dt=0.01×8000=80s总时长
 
     "n_offensive": 4,
     "n_defensive": 4,
@@ -132,27 +132,17 @@ DEFAULT_CONFIG = {
     },
 
     # === V22: 锁定后追击配置 ===
-    # V31 核心改动: 拦截器飞越目标后转弯能力大幅退化
-    # 这是突防场景的关键设定 — 一旦被突破就很难回头追上
     "pursuit": {
-        "forward_only": False,         # 锁定后允许回头追击(但受限)
+        "forward_only": False,         # 锁定后允许回头追击
         "forward_half_angle": np.deg2rad(100.0),
         "abandon_on_pass": False,      # 锁定后不因飞过放弃
         "no_uturn": False,
-        # V31: 飞越后转弯退化参数
-        "uturn_ay_fraction": 0.20,     # 目标在后半球时, ay_max仅为正常的20%
-        "uturn_ax_brake": -8.0,        # 回头时先减速 (m/s², 负值=减速)
-        "uturn_recovery_steps": 500,   # 500步(5秒@dt=0.01)逐渐恢复全机动力
-        "uturn_engage_after_pass": True,  # 飞越后仍尝试追击(但很慢)
-        "passed_distance_abandon": 800.0,  # 飞越后拉开>800m → 彻底放弃
     },
 
     "pn_nav_gain": 4,            # V25fix: 3→4, 提高PN侧向修正能力
     "pn_direct_freq": 20.0,
     "pn_guide_freq": 5.0,        # V25fix: 2→5Hz, 保持低频但减少过大滞后
     "pn_extrapolate_horizon": 0.2,  # V26: 外推预测时间(秒), 用来补偿制导更新延迟
-    # V31: 降低拦截器制导更新频率 (回头后信息延迟更大)
-    "pn_guide_freq_rear": 1.0,   # 目标在后半球时, 制导更新降为1Hz
 
     "assignment": {
         "method": "hungarian",
@@ -162,52 +152,40 @@ DEFAULT_CONFIG = {
         "reassign_interval": 20,      # (保留字段但无效, reassign=False)
     },
 
-    # === V36 奖励: 修复dt=0.01信号缩放问题 ===
-    # V35问题: approach(0.045/step) << proximity(0.267/step@1000m) << closing(1.125/step)
-    # V36修复: 1)approach_norm 300→60(5x stronger) 2)proximity 0.4→0.1 3)closing 3.0→1.5
+    # === 奖励 (V19: 大幅增强接近信号, 降低干扰项, 修复cost-reward失衡) ===
     "reward": {
-        # --- 核心: 接近目标 ---
-        "lambda_approach": 30.0,           # 距离减少奖励 (delta_rho/norm * lambda)
-        "approach_norm_dist": 60.0,        # V36: 300→60 (dt=0.01步长0.45m, r_app=0.225/step)
-        "close_range_threshold": 500.0,    # 500m内开始放大
-        "close_range_max_multiplier": 10.0, # V36: 15→10 (避免近距梯度爆炸)
-
-        # --- 核心: 航向对准 ---
-        "lambda_heading_align": 0.2,       # V36: 0.15→0.2 (稍强化航向信号)
-
-        # --- 核心: 闭合速度 ---
-        "lambda_closing": 1.5,             # V36: 3.0→1.5 (原1.125/step→0.56/step, 不再压倒approach)
-
-        # --- 核心: 距离惩罚 (防止绕圈) ---
-        "lambda_proximity": 0.1,           # V36: 0.4→0.1 (@1000m: 0.067/step, 不再压倒approach)
-        "proximity_norm_dist": 1500.0,     # 归一化距离
-
-        # --- 安全惩罚 (仅物理) ---
-        "lambda_penalty_boundary": 2.0,    # 越界
-        "lambda_penalty_ground": 1.0,      # 贴地
-
-        # --- 被杀/命中 ---
-        "killed_penalty": -0.5,            # 被杀几乎不罚 → 鼓励勇敢突入
-        "hit_hvt_bonus": 8000.0,           # 命中巨额奖 (V34:6000→8000)
-        "step_penalty": -0.003,            # 微弱步惩罚
-
-        # --- 终端奖励 (V35简化) ---
-        "lambda_terminal_hit": 800.0,      # 每命中一架的终端奖
-        "lambda_terminal_dist": 500.0,     # 距离终端奖 (越近越好)
-
-        # --- 超时惩罚 (env.step直接引用, 必须保留) ---
-        "timeout_penalty": -100.0,         # timeout基础惩罚
-        "timeout_distance_penalty_coef": 1000.0, # 基于距离的timeout额外惩罚
+        "hit_hvt_bonus": 6000.0,           # V19: 4000→6000, 超强终端信号
+        "approach_hvt_coef": 2500.0,       # V19: 1000→2500, 前进信号必须压倒cost
+        "closest_bonus_coef": 400.0,       # V19: 300→400
+        "progress_coef": 1.5,              # V19: 0.5→1.5, 持续的距离进度奖励
+        "proximity_reward_coef": 6.0,      # V19: 2.0→6.0, 距HVT越近每步奖励越大(指数放大)
+        "retreat_penalty": -0.15,          # V19: -0.25→-0.15, 适当放松(避免过度惩罚探索)
+        "mutual_kill_team_bonus": 100.0,
+        "detected_penalty": -0.005,        # V19: -0.01→-0.005, 被探测是接近HVT的必然代价
+        "killed_penalty": -3.0,            # V19: -5.0→-3.0, 减轻被杀惩罚(牺牲换接近是值得的)
+        "step_penalty": -0.005,            # V19: -0.01→-0.005
+        "timeout_penalty": -120.0,         # V19: -80→-120, 更强timeout压力
+        "timeout_distance_penalty_coef": 800.0,  # V19: 600→800, timeout时按距离重罚
+        "timeout_alive_penalty": -30.0,    # V19: -20→-30
+        "smooth_action_coef": -0.002,      # V19: -0.005→-0.002, 减弱动作平滑惩罚
+        "altitude_penalty_coef": 12.0,     # V19: 18→12, 适当放松高度惩罚
+        "high_alt_penalty_coef": 5.0,      # V19: 8→5
+        "spread_bonus_coef": 0.01,
+        # === 距离里程碑奖励 (V19新增) ===
+        "milestone_bonuses": {1500: 50.0, 1000: 100.0, 500: 200.0, 200: 400.0},  # V23: 匹配缩小战场距离
+        # === V24: FOV逃逸奖励已移除 — 用诱饵牺牲奖励替代 ===
+        "decoy_sacrifice_bonus": 800.0,    # 诱饵无人机被击杀时给全队的奖励
+        "decoy_attract_coef": 2.0,         # 吸引拦截器的持续奖励系数
+        "decoy_front_bonus_coef": 1.5,     # 前方引诱无人机额外奖励系数
     },
 
-    # V28: cost 全部并入 reward, 保留字段但不再使用
     "cost": {
-        "fov_exposure": 0.0,
-        "danger_zone": 0.0,
-        "collision": 0.0,
-        "boundary": 0.0,
-        "ground_crash": 0.0,
-        "speed_violation": 0.0,
+        "fov_exposure": 0.3,        # V19: 1.0→0.3, 大幅降低! 被探测是接近HVT的必经之路
+        "danger_zone": 1.0,        # V19: 3.0→1.0, 大幅降低! 必须穿越拦截器才能到HVT
+        "collision": 5.0,
+        "boundary": 2.0,
+        "ground_crash": 5.0,        # V19: 10.0→5.0
+        "speed_violation": 0.5,
     },
 
     # === 解析先验模块配置 (Analytic Priors) ===
@@ -309,7 +287,7 @@ DEFAULT_CONFIG = {
 
     # === 点目标命中配置 ===
     "point_target": {
-        "hit_threshold": 50.0,                 # V33: 30m→50m, 训练早期更容易触发命中奖励
+        "hit_threshold": 3.0,                  # V22: 3m 点目标命中
         "record_miss_distance": True,          # 逐步记录脱靶量
     },
 

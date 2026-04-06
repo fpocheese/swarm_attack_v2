@@ -53,10 +53,16 @@ def render_frame(ax, env, step_num=0, show_fov=True):
     cz = np.ones_like(theta) * hvt.z
     ax.plot3D(cx, cy, cz, color='orange', linewidth=1, linestyle='-', alpha=0.5)
 
+    no_target_alive_defs = []
+
     # 防御方
     for i, d in enumerate(env.defensives):
-        color = 'red' if d.alive else 'gray'
-        alpha_val = 1.0 if d.alive else 0.3
+        # 用户需求: 判定死亡后飞机从动图中消失
+        if not d.alive:
+            continue
+
+        color = 'red'
+        alpha_val = 1.0
         
         # 3D视野：真实三维圆锥示意
         if show_fov and d.alive:
@@ -109,19 +115,33 @@ def render_frame(ax, env, step_num=0, show_fov=True):
                           color='red', alpha=0.2, linestyle='--')
             
         _draw_aircraft_3d(ax, d, color, alpha_val, label=f'D{i}')
-        if d.alive and len(d.trajectory) > 1:
+        if len(d.trajectory) > 1:
             traj = np.array(d.trajectory)
             ax.plot3D(traj[:, 0], traj[:, 1], traj[:, 2], color='red', alpha=0.3, linewidth=1.0)
 
+        # 目标可视化: 画出拦截器当前打击目标连线(若有)
+        if hasattr(env, 'defensive_policies') and i < len(env.defensive_policies):
+            policy = env.defensive_policies[i]
+            tgt = getattr(policy, 'target', None)
+            if tgt is not None and getattr(tgt, 'alive', False) and not getattr(tgt, 'hit_hvt', False):
+                ax.plot3D([d.x, tgt.x], [d.y, tgt.y], [d.z, tgt.z],
+                          color='yellow', alpha=0.35, linewidth=1.2, linestyle='-')
+            else:
+                no_target_alive_defs.append(i)
+
     # 进攻方
     for i, off in enumerate(env.offensives):
+        # 用户需求: 判定死亡后飞机从动图中消失
+        if (not off.alive) and (not getattr(off, 'hit_hvt', False)):
+            continue
+
         if hasattr(off, 'hit_hvt') and off.hit_hvt:
             color = 'lime'
         elif off.alive:
             color = 'blue'
         else:
             color = 'gray'
-        alpha_val = 1.0 if off.alive else 0.3
+        alpha_val = 1.0 if off.alive else 0.6
         
         _draw_aircraft_3d(ax, off, color, alpha_val, label=f'O{i}',
                        marker_size=12 if off.alive else 8)
@@ -140,6 +160,8 @@ def render_frame(ax, env, step_num=0, show_fov=True):
     n_det = sum(1 for o in env.offensives if o.alive and o.detected)
     info_text = f'Off alive: {off_alive}/{env.n_offensive}\n'
     info_text += f'Detected: {n_det}\nHits: {env.hit_count}'
+    if no_target_alive_defs:
+        info_text += f"\nNoTarget Def: {','.join([f'D{i}' for i in no_target_alive_defs])}"
     ax.text2D(0.98, 0.98, info_text, transform=ax.transAxes, fontsize=8,
             verticalalignment='top', horizontalalignment='right',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -147,7 +169,6 @@ def render_frame(ax, env, step_num=0, show_fov=True):
 
 def _draw_aircraft_3d(ax, aircraft, color, alpha=1.0, label='', marker_size=10):
     if not aircraft.alive and not getattr(aircraft, 'hit_hvt', False):
-        ax.scatter3D(aircraft.x, aircraft.y, aircraft.z, marker='x', color='gray', s=marker_size*4, alpha=0.5)
         return
     
     # 用简单的散点或线表示3D朝向的无人机

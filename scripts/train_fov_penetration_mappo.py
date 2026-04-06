@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """
-FOV Penetration MACPO 训练脚本 V3
+FOV Penetration MAPPO 训练脚本
 =====================================
-三维同构集群, 支持 --scenario 工况切换
+三维同构集群, 纯奖励优化 (无 cost 约束)
+基于 train_fov_penetration_macpo.py, 替换为 MAPPO runner
 """
 import sys
 import os
@@ -36,40 +37,42 @@ def _get_ap_override(ap_config_name: str) -> dict:
             "enable_cone_cost": False,
             "enable_assignment_mismatch_reward": False,
             "enable_escape_reward": False,
-        }}
-    elif ap_config_name == "cone":
-        return {"analytic_priors": {
-            "enable_cone_cost": True,
-            "enable_assignment_mismatch_reward": False,
-            "enable_escape_reward": False,
-        }}
-    elif ap_config_name == "cone_mismatch":
-        return {"analytic_priors": {
-            "enable_cone_cost": True,
-            "enable_assignment_mismatch_reward": True,
-            "enable_escape_reward": False,
-        }}
-    elif ap_config_name == "full":
-        return {"analytic_priors": {
-            "enable_cone_cost": True,
-            "enable_assignment_mismatch_reward": True,
-            "enable_escape_reward": True,
+            "enable_decoy_game": False,
+            "enable_effective_penetration": False,
         }}
     elif ap_config_name == "v22":
-        # V22: FOV trigger lock + decoy game + effective penetration
+        return {"analytic_priors": {
+            "enable_cone_cost": False,      # MAPPO 不用 cost, cone_cost 无意义
+            "enable_assignment_mismatch_reward": False,
+            "enable_escape_reward": True,
+            "enable_decoy_game": True,
+            "enable_effective_penetration": True,
+        }}
+    elif ap_config_name == "v22_full":
+        return {"analytic_priors": {
+            "enable_cone_cost": True,       # 仍计算但仅进 info, 不影响策略
+            "enable_assignment_mismatch_reward": False,
+            "enable_escape_reward": True,
+            "enable_decoy_game": True,
+            "enable_effective_penetration": True,
+        }}
+    elif ap_config_name == "v28":
+        # V28: 全部 AP 模块启用 — obs 和 reward 都需要
         return {"analytic_priors": {
             "enable_cone_cost": True,
             "enable_assignment_mismatch_reward": False,
             "enable_escape_reward": True,
             "enable_decoy_game": True,
             "enable_effective_penetration": True,
+            "enable_hvt_guidance": True,
+            "enable_attack_gate_reward": False,  # V28 奖励函数内部处理
         }}
     else:
         return {}
 
 
 def make_train_env(all_args):
-    ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'full'))
+    ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
 
     def get_env_fn(rank):
         def init_env():
@@ -85,7 +88,7 @@ def make_train_env(all_args):
 
 
 def make_eval_env(all_args):
-    ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'full'))
+    ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
 
     def get_env_fn(rank):
         def init_env():
@@ -105,12 +108,11 @@ def parse_args(args, parser):
                         choices=['scenario_1', 'scenario_2', 'scenario_3'],
                         help='scenario_1=4v4, scenario_2=4v6, scenario_3=6v4')
     parser.add_argument("--use_single_network", action='store_true', default=False)
-    parser.add_argument('--ap_config', type=str, default='full',
-                        choices=['none', 'cone', 'cone_mismatch', 'full', 'v22'],
-                        help='Analytic priors ablation config: '
-                             'none=baseline, cone=cone_cost only, '
-                             'cone_mismatch=cone+mismatch, full=all three, '
-                             'v22=decoy_game+effective_penetration (V22)')
+    parser.add_argument('--ap_config', type=str, default='v28',
+                        choices=['none', 'v22', 'v22_full', 'v28'],
+                        help='Analytic priors config: '
+                             'none=no AP, v22=decoy+escape+eff_pen, '
+                             'v22_full=v22+cone_cost, v28=all AP modules')
     all_args = parser.parse_known_args(args)[0]
     return all_args
 
@@ -119,10 +121,11 @@ def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
 
-    if all_args.algorithm_name == "macpo":
+    # MAPPO: always use separated policy, no cost constraint
+    if all_args.algorithm_name == "mappo":
         all_args.share_policy = False
     else:
-        raise NotImplementedError(f"Only macpo supported, got {all_args.algorithm_name}")
+        raise NotImplementedError(f"This script supports mappo only, got {all_args.algorithm_name}")
 
     if all_args.cuda and torch.cuda.is_available():
         print("Using GPU...")
@@ -159,7 +162,7 @@ def main(args):
             os.makedirs(str(run_dir))
 
     setproctitle.setproctitle(
-        f"macpo-fov-{all_args.experiment_name}@{all_args.user_name}")
+        f"mappo-fov-{all_args.experiment_name}@{all_args.user_name}")
 
     torch.manual_seed(all_args.seed)
     torch.cuda.manual_seed_all(all_args.seed)
@@ -169,9 +172,9 @@ def main(args):
     eval_envs = make_eval_env(all_args) if all_args.use_eval else None
     num_agents = envs.n_agents
 
-    print(f"=== FOV Penetration MACPO Training V3 ===")
+    print(f"=== FOV Penetration MAPPO Training ===")
     print(f"Scenario: {all_args.scenario}")
-    print(f"Analytic Priors: {getattr(all_args, 'ap_config', 'full')}")
+    print(f"Analytic Priors: {getattr(all_args, 'ap_config', 'v22')}")
     print(f"Num agents (trained): {num_agents}")
     print(f"Obs dim: {envs.observation_space[0].shape}")
     print(f"Share obs dim: {envs.share_observation_space[0].shape}")
@@ -190,7 +193,8 @@ def main(args):
         "run_dir": run_dir
     }
 
-    from macpo.runner.separated.mujoco_runner_macpo import MujocoRunner as Runner
+    # Use MAPPO runner (no cost constraint)
+    from macpo.runner.separated.mujoco_runner import MujocoRunner as Runner
     runner = Runner(config)
     runner.run()
 

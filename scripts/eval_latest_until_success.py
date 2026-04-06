@@ -54,6 +54,8 @@ def load_policies(env, model_dir, hidden_size=256, layer_N=3, device=torch.devic
     all_args.algorithm_name = "macpo"
     all_args.hidden_size = hidden_size
     all_args.layer_N = layer_N
+    all_args.use_recurrent_policy = True
+    all_args.use_feature_normalization = False
 
     policies = []
     for agent_id in range(env.n_agents):
@@ -97,8 +99,12 @@ def run_one_episode(env, policies, seed, hidden_size, device, capture_frames=Fal
     dists = [[] for _ in range(n_agents)]
     z_pos = [[] for _ in range(n_agents)]
     speeds = [[] for _ in range(n_agents)]
+    headings = [[] for _ in range(n_agents)]
     gammas = [[] for _ in range(n_agents)]
+    accels = [[] for _ in range(n_agents)]
     xy_traj = [[] for _ in range(n_agents)]
+
+    dt = float(getattr(env, 'dt', 0.1))
 
     frames = []
     fig = None
@@ -116,8 +122,14 @@ def run_one_episode(env, policies, seed, hidden_size, device, capture_frames=Fal
             dists[i].append(float(dist))
             z_pos[i].append(float(off.z) if off.alive else np.nan)
             speeds[i].append(float(off.v) if off.alive else np.nan)
+            headings[i].append(float(np.degrees(off.heading)) if off.alive else np.nan)
             gammas[i].append(float(np.degrees(off.gamma)) if off.alive else np.nan)
             xy_traj[i].append((float(off.x), float(off.y)))
+
+            if off.alive and len(speeds[i]) >= 2 and np.isfinite(speeds[i][-1]) and np.isfinite(speeds[i][-2]):
+                accels[i].append((speeds[i][-1] - speeds[i][-2]) / dt)
+            else:
+                accels[i].append(np.nan)
 
         actions = get_actions(policies, obs, device, hidden_size)
         obs, _, rewards, costs, dones, infos, _ = env.step(actions)
@@ -163,7 +175,9 @@ def run_one_episode(env, policies, seed, hidden_size, device, capture_frames=Fal
         "dists": dists,
         "z_pos": z_pos,
         "speeds": speeds,
+        "headings": headings,
         "gammas": gammas,
+        "accels": accels,
         "xy_traj": xy_traj,
         "frames": frames,
     }
@@ -211,7 +225,7 @@ def plot_success_diagnostics(success_ep, out_path):
     n_agents = len(success_ep["dists"])
     colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3']
 
-    fig, axes = plt.subplots(3, 2, figsize=(16, 13))
+    fig, axes = plt.subplots(4, 2, figsize=(16, 17))
     fig.suptitle(
         f"Successful Episode Diagnostics | seed={success_ep['seed']} | "
         f"len={success_ep['episode_length']} | reward={success_ep['episode_reward']:.1f} | "
@@ -250,12 +264,26 @@ def plot_success_diagnostics(success_ep, out_path):
 
     ax = axes[2, 0]
     for i in range(n_agents):
+        ax.plot(success_ep["headings"][i], color=colors[i % len(colors)], label=f"Agent{i}")
+    ax.set_title('Heading (deg)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[2, 1]
+    for i in range(n_agents):
         ax.plot(success_ep["gammas"][i], color=colors[i % len(colors)], label=f"Agent{i}")
     ax.set_title('Flight-path angle gamma (deg)')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
 
-    ax = axes[2, 1]
+    ax = axes[3, 0]
+    for i in range(n_agents):
+        ax.plot(success_ep["accels"][i], color=colors[i % len(colors)], label=f"Agent{i}")
+    ax.set_title('Approx acceleration dv/dt (m/s^2)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[3, 1]
     for i in range(n_agents):
         traj = success_ep["xy_traj"][i]
         xs = [p[0] for p in traj]

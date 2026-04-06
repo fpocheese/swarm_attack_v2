@@ -26,16 +26,18 @@ class MujocoRunner(Runner):
 
         for episode in range(episodes):
             if self.use_linear_lr_decay:
-                self.trainer.policy.lr_decay(episode, episodes)
+                for t in self.trainer:
+                    t.policy.lr_decay(episode, episodes)
 
             done_episodes_rewards = []
+            custom_env_infos = {}
 
             for step in range(self.episode_length):
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
 
-                # Obser reward and next obs
-                obs, share_obs, rewards, dones, infos, _ = self.envs.step(actions)
+                # Obser reward and next obs (costs ignored in MAPPO)
+                obs, share_obs, rewards, _costs, dones, infos, _ = self.envs.step(actions)
 
                 dones_env = np.all(dones, axis=1)
                 reward_env = np.mean(rewards, axis=1).flatten()
@@ -44,6 +46,29 @@ class MujocoRunner(Runner):
                     if dones_env[t]:
                         done_episodes_rewards.append(train_episode_rewards[t])
                         train_episode_rewards[t] = 0
+                        # Collect custom episode-end info
+                        try:
+                            ep_info = infos[t][0] if isinstance(infos[t], list) else infos[t]
+                            _custom_keys = [
+                                "cone_cost", "avg_cone_cost_per_agent",
+                                "Z_ij_mean", "Z_ij_max", "Z_tilde_mean", "Z_tilde_max",
+                                "M_tilde", "mismatch_reward", "m_j_mean", "m_j_max",
+                                "delta_M_tilde", "ap_episode_max_M_tilde",
+                                "escape_reward", "Gamma_mean", "Gamma_max",
+                                "Xi_mean", "Xi_max", "near_trigger_count",
+                                "success", "hit_count", "n_escapes_total",
+                                "n_escaped_agents", "offensive_alive", "defensive_alive",
+                                "two_stage_score", "curriculum_mult",
+                            ]
+                            for k in _custom_keys:
+                                if k in ep_info:
+                                    val = ep_info[k]
+                                    if isinstance(val, (int, float, np.integer, np.floating)):
+                                        if k not in custom_env_infos:
+                                            custom_env_infos[k] = []
+                                        custom_env_infos[k].append(float(val))
+                        except Exception:
+                            pass
 
                 data = obs, share_obs, rewards, dones, infos, \
                        values, actions, action_log_probs, \
@@ -82,6 +107,17 @@ class MujocoRunner(Runner):
                     print("some episodes done, average rewards: ", aver_episode_rewards)
                     self.writter.add_scalars("train_episode_rewards", {"aver_rewards": aver_episode_rewards},
                                              total_num_steps)
+
+                # Log custom env info (success, hit_count, etc.)
+                if custom_env_infos:
+                    for k, v_list in custom_env_infos.items():
+                        if len(v_list) > 0:
+                            mean_v = np.mean(v_list)
+                            if self.use_wandb:
+                                wandb.log({"env/" + k: mean_v}, step=total_num_steps)
+                            else:
+                                self.writter.add_scalars("env/" + k, {"env/" + k: mean_v}, total_num_steps)
+                    custom_env_infos = {}  # reset for next interval
 
             # eval
             if episode % self.eval_interval == 0 and self.use_eval:
@@ -196,8 +232,8 @@ class MujocoRunner(Runner):
 
             eval_actions = np.array(eval_actions_collector).transpose(1, 0, 2)
 
-            # Obser reward and next obs
-            eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, _ = self.eval_envs.step(
+            # Obser reward and next obs (costs ignored in MAPPO)
+            eval_obs, eval_share_obs, eval_rewards, _eval_costs, eval_dones, eval_infos, _ = self.eval_envs.step(
                 eval_actions)
             for eval_i in range(self.n_eval_rollout_threads):
                 one_episode_rewards[eval_i].append(eval_rewards[eval_i])

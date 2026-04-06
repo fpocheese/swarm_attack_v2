@@ -1,318 +1,292 @@
-"""FOV Penetration Environment - Reward & Cost V19
+"""FOV Penetration Environment - Reward & Cost V36
 ===================================================
-V19 关键改进 (解决v18 cost-reward失衡问题):
-  1. 接近奖励从除以obs_range改为除以init_dist, 信号强度提升2.5x
-  2. proximity_reward 幂次从2→3, 近距离信号更锐利
-  3. 新增距离里程碑奖励: 首次到达3000/2000/1000/500m时给大额奖励
-  4. 降低高度/gamma惩罚系数, 减少与接近信号的对冲
-  5. 降低被探测/被击杀惩罚, 让策略敢于接近
-  6. 强化timeout惩罚, 英雄不问出处只问前进
+V36: Fix dt=0.01 reward scaling problem from V35
+
+V35问题诊断:
+  approach_reward = 30 * 0.45m / 300 = 0.045/step (微弱)
+  closing_speed   = 3.0 * 45/120 = 1.125/step (过强, 压倒approach)
+  proximity_pen   = 0.4 * d/1500 = 0.267/step @1000m (比approach大6x)
+  → 信号失衡, closing独大, agent无法有效学习减小距离
+
+V36修复:
+  1. approach_norm_dist: 300→60 → r_app=0.225/step (5x stronger)
+  2. lambda_proximity: 0.4→0.1 → @1000m: 0.067/step (不压倒approach)
+  3. lambda_closing: 3.0→1.5 → 0.56/step (仍是最强信号但不压倒)
+  4. lambda_heading_align: 0.15→0.2 (稍强化)
+  5. close_range_max_multiplier: 15→10 (避免近距梯度爆炸)
+  6. max_steps: 6000→8000 (80s, 给机动留余量)
+  7. Fix reset obs bug (first obs had zeroed HVT guidance)
+
+V36各信号每步量级 (@1000m直飞, v=45m/s):
+  approach: 0.225/step (核心)
+  closing:  0.563/step (辅助)
+  heading:  0.200/step (辅助)
+  proximity: -0.067/step (弱惩罚)
+  → approach+closing+heading = 0.988/step >> proximity 0.067/step ✓
 """
 
 import numpy as np
+from .config import G
 
 
+# ======================================================================
+# Helper: sigmoid
+# ======================================================================
+def _sigmoid(x):
+    if x >= 0:
+        return 1.0 / (1.0 + np.exp(-x))
+    ex = np.exp(x)
+    return ex / (1.0 + ex)
+
+
+# ======================================================================
+# Helper: velocity vector
+# ======================================================================
+def _vel3d(entity):
+    cg = np.cos(entity.gamma)
+    return np.array([
+        entity.v * cg * np.cos(entity.heading),
+        entity.v * cg * np.sin(entity.heading),
+        entity.v * np.sin(entity.gamma),
+    ])
+
+
+# ======================================================================
+# Helper: closing speed (positive = approaching)
+# ======================================================================
+def _closing_speed_to_point_correct(off, px, py, pz):
+    r_iH = np.array([px - off.x, py - off.y, pz - off.z])
+    rho = np.linalg.norm(r_iH)
+    if rho < 1e-6:
+        return 0.0
+    v_i = _vel3d(off)
+    return float(np.dot(r_iH, v_i) / rho)
+
+
+# ======================================================================
+# Main: compute_rewards V35 — 极简目标优先
+# ======================================================================
 def compute_rewards(offensives, defensives, hvt, config,
                     prev_dists_to_hvt, hit_events, current_step,
                     just_killed=None, just_killed_def=None,
                     lock_on_map=None, prev_team_min_dist=None,
-                    escape_events=None, miss_events=None):
+                    escape_events=None, miss_events=None,
+                    defensive_policies=None,
+                    ap_data=None):
     """
-    计算奖励
-
-    新参数:
-        escape_events: list of dict, 本步发生的逃逸事件
-            [{"off_idx": i, "def_idx": j, "type": "fov_break"|"pass_through"}, ...]
-        miss_events: list of dict, 本步发生的脱靶事件
-            [{"off_idx": i, "def_idx": j, "reason": "..."}, ...]
+    V35 极简奖励: 只关心 '接近目标' 和 '面朝目标'.
     """
     rc = config["reward"]
     n_off = len(offensives)
     n_def = len(defensives)
-    obs_range = config["obs_range"]
-    z_min = config.get("z_min", 100.0)
-    z_min_safe = z_min * 2.0
     rewards = [0.0] * n_off
     reward_info = {}
-    init_dist = 5000.0  # 调整为v11_01场景的初始距离
 
     if just_killed is None:
         just_killed = [False] * n_off
-    if just_killed_def is None:
-        just_killed_def = [False] * n_def
-    if escape_events is None:
-        escape_events = []
-    if miss_events is None:
-        miss_events = []
+    if ap_data is None:
+        ap_data = {}
 
-    # 当前各架到HVT的距离
+    hvt_x, hvt_y, hvt_z = hvt.x, hvt.y, hvt.z
+
+    # 当前各架到 HVT 的距离
     cur_dists = []
     for i, off in enumerate(offensives):
         if off.alive and not off.hit_hvt:
-            cur_dists.append(off.distance_to(hvt.x, hvt.y, hvt.z))
+            cur_dists.append(off.distance_to(hvt_x, hvt_y, hvt_z))
         else:
             cur_dists.append(float('inf'))
 
-    alive_dists = [d for d in cur_dists if d < float('inf')]
-    team_min_dist = min(alive_dists) if alive_dists else init_dist
-    closest_idx = min(range(n_off), key=lambda i: cur_dists[i]) if alive_dists else -1
-
-    # ======================================================
-    # 1. 命中 HVT — 终极目标, 全队共享超级奖励
-    # ======================================================
-    if hit_events:
-        bonus = rc.get("hit_hvt_bonus", 2000.0) * len(hit_events)
-        for i in range(n_off):
-            rewards[i] += bonus
-        reward_info["hit_hvt"] = bonus
-
-    # ======================================================
-    # 2. 个人接近 HVT — 绝对主导奖励
-    #    已逃脱过拦截器的飞机: 奖励倍增!
-    # ======================================================
-    approach_coef = rc.get("approach_hvt_coef", 800.0)
-    post_escape_mult = rc.get("post_escape_approach_mult", 1.5)
-    escaped_set = set()
-    for ev in escape_events:
-        escaped_set.add(ev.get("off_idx", -1))
-
+    # ==========================================================
+    # 核心奖励 1: 距离减少奖励 (approach_reward)
+    # ==========================================================
+    # delta_rho / norm_dist * lambda, 归一化距离小 → 奖励信号大
+    lambda_approach = rc.get("lambda_approach", 30.0)
+    approach_norm = rc.get("approach_norm_dist", 300.0)
+    close_range_threshold = rc.get("close_range_threshold", 500.0)
+    close_range_max_mult = rc.get("close_range_max_multiplier", 15.0)
+    total_approach = 0.0
     for i, off in enumerate(offensives):
         if off.alive and not off.hit_hvt and prev_dists_to_hvt[i] < float('inf'):
-            delta = prev_dists_to_hvt[i] - cur_dists[i]
-            # V19: 改用 init_dist 归一化(而非obs_range), 信号强度提高
-            approach_r = approach_coef * delta / init_dist
-            dist_ratio = max(1.0 - cur_dists[i] / init_dist, 0.0)
-            approach_r *= (1.0 + 3.0 * dist_ratio)  # V19: 2.0→3.0, 接近时增幅更大
-            # V11_01: 已逃脱的飞机接近HVT奖励倍增
-            if hasattr(off, '_escaped_interceptor') and off._escaped_interceptor:
-                approach_r *= post_escape_mult
-            rewards[i] += approach_r
+            delta_rho = prev_dists_to_hvt[i] - cur_dists[i]  # 正=接近
+            r_app = lambda_approach * delta_rho / approach_norm
 
-    # ======================================================
-    # 3. 进度奖励 — 靠近HVT本身就给持续正奖励
-    # ======================================================
-    progress_coef = rc.get("progress_coef", 0.5)
+            # 近距放大
+            d = cur_dists[i]
+            if d < close_range_threshold:
+                t = max(1.0 - d / close_range_threshold, 0.0)
+                mult = 1.0 + (close_range_max_mult - 1.0) * (t ** 2)
+            else:
+                mult = 1.0
+            r_app *= mult
+
+            rewards[i] += r_app
+            total_approach += r_app
+    reward_info["reward_approach"] = total_approach
+
+    # ==========================================================
+    # 核心奖励 2: 航向对准HVT (heading_alignment)
+    # ==========================================================
+    # 机头朝向目标 → 正奖励, 背对 → 惩罚
+    lambda_heading = rc.get("lambda_heading_align", 0.15)
+    total_heading = 0.0
     for i, off in enumerate(offensives):
         if off.alive and not off.hit_hvt:
-            progress = max(1.0 - cur_dists[i] / init_dist, 0.0)
-            rewards[i] += progress_coef * progress
+            dx = hvt_x - off.x
+            dy = hvt_y - off.y
+            bearing = np.arctan2(dy, dx)
+            heading_err = bearing - off.heading
+            heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
+            # cos(heading_err): 1=完全对准, -1=完全背对
+            alignment = np.cos(heading_err)
+            r_head = lambda_heading * alignment
+            rewards[i] += r_head
+            total_heading += r_head
+    reward_info["reward_heading_align"] = total_heading
 
-    # ======================================================
-    # 3.5 V15新增: 持续距离奖励 (proximity reward)
-    #     距HVT越近, 每步基础奖励越大 (平方放大效果)
-    #     这为策略提供了始终如一的"距离梯度信号"
-    # ======================================================
-    proximity_coef = rc.get("proximity_reward_coef", 6.0)
+    # ==========================================================
+    # 核心奖励 3: 闭合速度奖励 (closing_speed)
+    # ==========================================================
+    lambda_closing = rc.get("lambda_closing", 3.0)
+    vel_range = max(config.get("vel_range", 120.0), 1.0)
+    total_closing = 0.0
     for i, off in enumerate(offensives):
         if off.alive and not off.hit_hvt:
-            d_norm = cur_dists[i] / init_dist  # 0~1
-            proximity = max(1.0 - d_norm, 0.0)  # 越近越大
-            # V19: 幂次提高到3次方, 近距离信号更锐利
-            rewards[i] += proximity_coef * proximity * proximity * proximity
+            Vc = _closing_speed_to_point_correct(off, hvt_x, hvt_y, hvt_z)
+            # 正闭合速度 → 奖励, 负闭合速度 → 惩罚
+            r_close = lambda_closing * Vc / vel_range
+            rewards[i] += r_close
+            total_closing += r_close
+    reward_info["reward_closing_speed"] = total_closing
 
-    # ======================================================
-    # 3.8 V19新增: 距离里程碑奖励
-    #     首次有agent到达某个距离HVT的门槛时,全队获得一次性奖励
-    # ======================================================
-    milestones = rc.get("milestone_bonuses", {})
-    if milestones and alive_dists:
-        for threshold, bonus_val in milestones.items():
-            threshold = float(threshold)
-            # 检查是否本步首次突破该门槛
-            prev_within = any(d < threshold for d in prev_dists_to_hvt if d < float('inf'))
-            cur_within = any(d < threshold for d in alive_dists)
-            if cur_within and not prev_within:
-                for i in range(n_off):
-                    if offensives[i].alive:
-                        rewards[i] += bonus_val
-                reward_info[f"milestone_{int(threshold)}m"] = bonus_val
-
-    # ======================================================
-    # 4. 最近突防者额外奖金
-    # ======================================================
-    if closest_idx >= 0 and prev_team_min_dist is not None:
-        team_delta = prev_team_min_dist - team_min_dist
-        closest_bonus = rc.get("closest_bonus_coef", 200.0) * team_delta / obs_range
-        dist_ratio = max(1.0 - team_min_dist / init_dist, 0.0)
-        closest_bonus *= (1.0 + 3.0 * dist_ratio)
-        rewards[closest_idx] += closest_bonus
-
-    # ======================================================
-    # 5. 后退惩罚
-    # ======================================================
-    retreat_pen = rc.get("retreat_penalty", -0.15)
+    # ==========================================================
+    # 核心惩罚: 距离惩罚 (proximity_penalty)
+    # ==========================================================
+    # 远离目标 → 持续惩罚, 越远越重
+    lambda_proximity = rc.get("lambda_proximity", 0.4)
+    proximity_norm = rc.get("proximity_norm_dist", 1500.0)
+    total_prox = 0.0
     for i, off in enumerate(offensives):
-        if off.alive and not off.hit_hvt and prev_dists_to_hvt[i] < float('inf'):
-            if prev_dists_to_hvt[i] - cur_dists[i] < 0:
-                rewards[i] += retreat_pen
+        if off.alive and not off.hit_hvt:
+            prox_pen = lambda_proximity * (cur_dists[i] / proximity_norm)
+            rewards[i] -= prox_pen
+            total_prox += prox_pen
+    reward_info["penalty_proximity"] = total_prox
 
-    # ======================================================
-    # 6. 被击杀惩罚
-    # ======================================================
-    killed_pen = rc.get("killed_penalty", -5.0)
+    # ==========================================================
+    # 安全惩罚 (仅保留物理安全: boundary + ground)
+    # ==========================================================
+    lambda_boundary = rc.get("lambda_penalty_boundary", 2.0)
+    map_size = config["map_size"]
+    total_boundary = 0.0
+    for i, off in enumerate(offensives):
+        if not off.alive:
+            continue
+        if abs(off.x) > map_size * 0.9 or abs(off.y) > map_size * 0.9:
+            rewards[i] -= lambda_boundary
+            total_boundary += lambda_boundary
+    reward_info["penalty_boundary"] = total_boundary
+
+    lambda_ground = rc.get("lambda_penalty_ground", 1.0)
+    total_ground = 0.0
+    for i, off in enumerate(offensives):
+        if not off.alive:
+            continue
+        z_min = config.get("z_min", 0.0)
+        z_min_safe = max(z_min * 2.0, 5.0)
+        if off.z < z_min_safe:
+            ratio = (z_min_safe - off.z) / max(z_min_safe, 1.0)
+            pen = lambda_ground * 2.0 * ratio * ratio
+            rewards[i] -= pen
+            total_ground += pen
+    reward_info["penalty_ground"] = total_ground
+
+    # ==========================================================
+    # 被击杀惩罚 (很小, 鼓励勇敢突入不怕死)
+    # ==========================================================
+    killed_pen = rc.get("killed_penalty", -0.5)
     for i in range(n_off):
         if just_killed[i] and not offensives[i].hit_hvt:
             rewards[i] += killed_pen
 
-    # ======================================================
-    # 7. 同归于尽全队共享
-    # ======================================================
-    n_off_killed = sum(1 for jk in just_killed if jk)
-    n_def_killed = sum(1 for jk in just_killed_def if jk)
-    if n_off_killed > 0 and n_def_killed > 0:
-        mutual_bonus = rc.get("mutual_kill_team_bonus", 80.0) * n_def_killed
-        alive_mates = [j for j in range(n_off) if offensives[j].alive and not offensives[j].hit_hvt]
-        if alive_mates:
-            per_mate = mutual_bonus / len(alive_mates)
-            for j in alive_mates:
-                rewards[j] += per_mate
+    # ==========================================================
+    # 命中 HVT — 巨额奖励, 全队共享
+    # ==========================================================
+    if hit_events:
+        hit_bonus = rc.get("hit_hvt_bonus", 8000.0) * len(hit_events)
         for i in range(n_off):
-            if just_killed[i]:
-                rewards[i] += rc.get("mutual_kill_team_bonus", 80.0) * 0.3
+            rewards[i] += hit_bonus
+        reward_info["hit_hvt"] = hit_bonus
 
-    # ======================================================
-    # 8. ★ V11_01新增: FOV逃逸奖励 ★
-    #    成功突破拦截器FOV锁定 → 大额奖励
-    #    这是训练进攻方学会"近距离突加速+侧飞"的关键激励
-    # ======================================================
-    fov_escape_bonus = rc.get("fov_escape_bonus", 200.0)
-    fov_escape_team_bonus = rc.get("fov_escape_team_bonus", 60.0)
-    if escape_events:
-        escaped_off_indices = set()
-        for ev in escape_events:
-            off_idx = ev.get("off_idx", -1)
-            if 0 <= off_idx < n_off and offensives[off_idx].alive:
-                escaped_off_indices.add(off_idx)
-                # 逃脱者本人获得大额奖励
-                rewards[off_idx] += fov_escape_bonus
-        if escaped_off_indices:
-            # 全队(存活者)分享队友逃逸的团队奖励
-            alive_mates = [j for j in range(n_off)
-                          if offensives[j].alive and not offensives[j].hit_hvt
-                          and j not in escaped_off_indices]
-            if alive_mates:
-                per_mate = fov_escape_team_bonus / len(alive_mates)
-                for j in alive_mates:
-                    rewards[j] += per_mate
-        reward_info["fov_escapes"] = len(escape_events)
-
-    # ======================================================
-    # 9. V11_01新增: 近距离大机动鼓励
-    #    在交战区附近做大横向机动时给小额奖励
-    #    (让模型知道: 有敌人近距离时, 做大机动是好事)
-    # ======================================================
-    close_evasion_coef = rc.get("close_evasion_coef", 1.5)
-    engagement_range = config.get("fov_escape", {}).get("engagement_range", 200.0)
-    for i, off in enumerate(offensives):
-        if not off.alive or off.hit_hvt:
-            continue
-        # 检查是否有拦截器在交战距离内
-        in_engagement = False
-        for d in defensives:
-            if d.alive and d.distance_3d(off) < engagement_range:
-                in_engagement = True
-                break
-        if in_engagement:
-            # 奖励大横向过载 (鼓励做规避机动)
-            lateral_g = abs(off.ny)
-            if lateral_g > 2.0:  # 超过2g的横向机动
-                evasion_r = close_evasion_coef * (lateral_g - 2.0) / 5.0
-                rewards[i] += evasion_r
-
-    # ======================================================
-    # 10. 探测惩罚
-    # ======================================================
-    det_pen = rc.get("detected_penalty", -0.01)
-    for i, off in enumerate(offensives):
-        if off.alive and off.detected:
-            rewards[i] += det_pen
-
-    # ======================================================
-    # 11. 高度保护 (V19: 放宽惩罚阈值, 降低gamma惩罚, 给更多空间)
-    # ======================================================
-    alt_coef = rc.get("altitude_penalty_coef", 12.0)   # V19: 18→12
-    high_coef = rc.get("high_alt_penalty_coef", 5.0)    # V19: 8→5
-    z_max = config.get("z_max", 2000.0)
-    z_high_thresh = z_max * 0.6       # V19: 0.5→0.6 (1200m才惩罚, 给更多空间)
-    z_safe_low = z_min * 2.5          # 250m
-    z_safe_high = 1000.0              # V19: 800→1000m (放宽安全区)
-    for i, off in enumerate(offensives):
-        if not off.alive:
-            continue
-        # 低空保护 (z < 200m)
-        if off.z < z_min_safe:
-            ratio = (z_min_safe - off.z) / z_min_safe
-            rewards[i] -= alt_coef * ratio * ratio
-        # 高空惩罚 (z > 1200m)
-        if off.z > z_high_thresh:
-            ratio_h = (off.z - z_high_thresh) / (z_max - z_high_thresh)
-            rewards[i] -= high_coef * ratio_h * ratio_h
-        gamma_deg = np.degrees(off.gamma)
-        # V19: 俯冲惩罚 (gamma < -5°, 从V15的-3°放宽)
-        if gamma_deg < -5.0:
-            dive = min((-gamma_deg - 5.0) / 12.0, 1.0)
-            rewards[i] -= alt_coef * 0.4 * dive        # V19: 0.6→0.4
-        # V19: 爬升惩罚 (gamma > 12°, 从V15的8°放宽)
-        if gamma_deg > 12.0:
-            climb = min((gamma_deg - 12.0) / 15.0, 1.0)
-            rewards[i] -= high_coef * 0.3 * climb       # V19: 0.5→0.3
-        # 安全高度奖励 (250-1000m)
-        if z_safe_low <= off.z <= z_safe_high:
-            rewards[i] += 0.02
-
-    # ======================================================
-    # 12. 步惩罚 + 动作平滑
-    # ======================================================
-    step_pen = rc.get("step_penalty", -0.01)
-    smooth_coef = rc.get("smooth_action_coef", -0.005)
+    # ==========================================================
+    # 步惩罚
+    # ==========================================================
+    step_pen = rc.get("step_penalty", -0.003)
     for i, off in enumerate(offensives):
         if off.alive:
             rewards[i] += step_pen
-            rewards[i] += smooth_coef * np.sqrt(off.ny**2 + off.nz**2)
-
-    # ======================================================
-    # 13. 分散阵型
-    # ======================================================
-    alive_idx = [i for i, off in enumerate(offensives) if off.alive and not off.hit_hvt]
-    spread_coef = rc.get("spread_bonus_coef", 0.01)
-    if len(alive_idx) >= 2 and spread_coef > 0:
-        for ii in range(len(alive_idx)):
-            for jj in range(ii + 1, len(alive_idx)):
-                d_ij = offensives[alive_idx[ii]].distance_3d(offensives[alive_idx[jj]])
-                if d_ij > 200:
-                    sr = spread_coef * min((d_ij - 200) / 1800.0, 1.0)
-                    rewards[alive_idx[ii]] += sr
-                    rewards[alive_idx[jj]] += sr
 
     return rewards, reward_info
 
 
+# ======================================================================
+# compute_costs: 全部并入 reward, costs 返回零
+# ======================================================================
 def compute_costs(offensives, defensives, config):
-    """约束成本函数 (基本不变)"""
-    cc = config["cost"]
     n_off = len(offensives)
-    fov_half = config["fov_half_angle"]
-    det_range = config["detection_range"]
-    z_min = config.get("z_min", 100.0)
-    map_size = config["map_size"]
-    costs = [0.0] * n_off
-    for i, off in enumerate(offensives):
-        if not off.alive:
-            continue
-        for d in defensives:
-            if d.alive and d.is_in_fov(off.x, off.y, off.z, fov_half, det_range):
-                costs[i] += cc["fov_exposure"]
-        for d in defensives:
-            if d.alive:
-                dist = off.distance_3d(d)
-                if dist < 300.0:
-                    costs[i] += cc["danger_zone"] * (1.0 - dist / 300.0)
-        if abs(off.x) > map_size * 0.9 or abs(off.y) > map_size * 0.9:
-            costs[i] += cc["boundary"]
-        if off.z < z_min * 2.0:
-            costs[i] += cc["ground_crash"] * (1.0 - off.z / (z_min * 2.0))
-        for j, other in enumerate(offensives):
-            if j != i and other.alive:
-                if off.distance_3d(other) < config["collision_range"]:
-                    costs[i] += cc["collision"]
-    return costs, {}
+    return [0.0] * n_off, {}
+
+
+# ======================================================================
+# Terminal Reward V35 — 简化: 主要看命中 + 距离
+# ======================================================================
+def compute_terminal_rewards(offensives, hvt, config, ap_data=None):
+    """
+    V35终端奖励 — 极简:
+      命中奖 + 距离奖/罚 - 全军覆没惩罚
+    """
+    rc = config["reward"]
+    n_off = len(offensives)
+
+    N_hit = sum(1 for off in offensives if off.hit_hvt)
+    N_alive = sum(1 for off in offensives if off.alive)
+
+    # 存活agent到HVT的最小距离
+    min_dist = float('inf')
+    sum_dist = 0.0
+    n_valid = 0
+    for off in offensives:
+        if off.alive and not off.hit_hvt:
+            d = off.distance_to(hvt.x, hvt.y, hvt.z)
+            min_dist = min(min_dist, d)
+            sum_dist += d
+            n_valid += 1
+
+    if min_dist == float('inf'):
+        min_dist = 2000.0
+
+    # 终端奖励
+    lambda_hit = rc.get("lambda_terminal_hit", 800.0)
+    lambda_dist = rc.get("lambda_terminal_dist", 500.0)
+    max_dist_ref = 2000.0
+
+    # 命中奖励
+    terminal_r = lambda_hit * N_hit
+
+    # 距离奖励: 越近越好 (即使没命中, 靠得近也给奖)
+    dist_reward = lambda_dist * max(1.0 - min_dist / max_dist_ref, 0.0)
+    terminal_r += dist_reward
+
+    # 全军覆没额外惩罚
+    if N_alive == 0 and N_hit == 0:
+        terminal_r -= 100.0
+
+    rewards = [terminal_r / max(n_off, 1)] * n_off
+
+    info = {
+        "terminal_N_hit": N_hit,
+        "terminal_N_alive": N_alive,
+        "terminal_min_dist": min_dist,
+        "terminal_reward": terminal_r,
+    }
+    return rewards, info
