@@ -577,7 +577,8 @@ class FOVPenetrationEnv:
             escape_events=step_escapes,
             miss_events=step_misses,
             defensive_policies=self.defensive_policies,
-            ap_data=ap_data)
+            ap_data=ap_data,
+            raw_actions=actions)
 
         # 更新prev状态
         cur_dists = []

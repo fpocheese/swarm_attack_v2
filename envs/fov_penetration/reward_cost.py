@@ -1,28 +1,25 @@
-"""FOV Penetration Environment - Reward & Cost V36
+"""FOV Penetration Environment - Reward & Cost V37
 ===================================================
-V36: Fix dt=0.01 reward scaling problem from V35
+V37: 修复 '飞歪' 问题 — 强化航向修正, 抑制mu偏置
 
-V35问题诊断:
-  approach_reward = 30 * 0.45m / 300 = 0.045/step (微弱)
-  closing_speed   = 3.0 * 45/120 = 1.125/step (过强, 压倒approach)
-  proximity_pen   = 0.4 * d/1500 = 0.267/step @1000m (比approach大6x)
-  → 信号失衡, closing独大, agent无法有效学习减小距离
+V36诊断 (飞行轨迹诊断脚本确认):
+  Agent mu偏置0.04 → 航向漂移1.6°/s → 50s偏80°
+  Agent mu偏置0.20 → 航向漂移7.4°/s → 60s偏444° (转了好几圈!)
+  根因: cos(heading_err)小角度梯度≈0, closing奖励独大
+  自由agent没有足够的航向纠正信号
 
-V36修复:
-  1. approach_norm_dist: 300→60 → r_app=0.225/step (5x stronger)
-  2. lambda_proximity: 0.4→0.1 → @1000m: 0.067/step (不压倒approach)
-  3. lambda_closing: 3.0→1.5 → 0.56/step (仍是最强信号但不压倒)
-  4. lambda_heading_align: 0.15→0.2 (稍强化)
-  5. close_range_max_multiplier: 15→10 (避免近距梯度爆炸)
-  6. max_steps: 6000→8000 (80s, 给机动留余量)
-  7. Fix reset obs bug (first obs had zeroed HVT guidance)
+V37修复:
+  1. +heading_error_penalty: λ*(err/π)² (30°偏航 → -0.022/step, 强梯度)
+  2. +mu_regularization: λ*|a[2]| (防止无意义转弯)
+  3. heading_align: 0.2→0.5 (2.5x增强)
+  4. closing: 1.5→0.8 (不再主导)
+  5. close_range_threshold: 500→800 (更早放大)
 
-V36各信号每步量级 (@1000m直飞, v=45m/s):
-  approach: 0.225/step (核心)
-  closing:  0.563/step (辅助)
-  heading:  0.200/step (辅助)
-  proximity: -0.067/step (弱惩罚)
-  → approach+closing+heading = 0.988/step >> proximity 0.067/step ✓
+V37各信号每步量级 (@1000m直飞, v=45m/s):
+  approach: 0.225, heading_align: +0.500, heading_pen: 0.000
+  closing: +0.300, mu_reg: 0.000, proximity: -0.100
+  NET: +0.925/step (直飞最优)
+ @1000m 30°偏航: NET=+0.751 (-18.8%, V36仅-14%)
 """
 
 import numpy as np
@@ -72,7 +69,8 @@ def compute_rewards(offensives, defensives, hvt, config,
                     lock_on_map=None, prev_team_min_dist=None,
                     escape_events=None, miss_events=None,
                     defensive_policies=None,
-                    ap_data=None):
+                    ap_data=None,
+                    raw_actions=None):
     """
     V35 极简奖励: 只关心 '接近目标' 和 '面朝目标'.
     """
@@ -145,6 +143,26 @@ def compute_rewards(offensives, defensives, hvt, config,
     reward_info["reward_heading_align"] = total_heading
 
     # ==========================================================
+    # V37新增: 航向误差平方惩罚 (heading_error_penalty)
+    # ==========================================================
+    # cos(err)在小角度梯度≈0, 而(err/π)²在任何角度都有强梯度
+    # 30°偏航: penalty = 0.8*(30/180)² = 0.022/step
+    # 90°偏航: penalty = 0.8*(90/180)² = 0.200/step (!很重)
+    lambda_heading_pen = rc.get("lambda_heading_error_penalty", 0.8)
+    total_heading_pen = 0.0
+    for i, off in enumerate(offensives):
+        if off.alive and not off.hit_hvt:
+            dx = hvt_x - off.x
+            dy = hvt_y - off.y
+            bearing = np.arctan2(dy, dx)
+            heading_err = bearing - off.heading
+            heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
+            pen = lambda_heading_pen * (heading_err / np.pi) ** 2
+            rewards[i] -= pen
+            total_heading_pen += pen
+    reward_info["penalty_heading_error"] = total_heading_pen
+
+    # ==========================================================
     # 核心奖励 3: 闭合速度奖励 (closing_speed)
     # ==========================================================
     lambda_closing = rc.get("lambda_closing", 3.0)
@@ -172,6 +190,22 @@ def compute_rewards(offensives, defensives, hvt, config,
             rewards[i] -= prox_pen
             total_prox += prox_pen
     reward_info["penalty_proximity"] = total_prox
+
+    # ==========================================================
+    # V37新增: mu正则化 (防止无意义转弯)
+    # ==========================================================
+    # 惩罚|action[2]| — 鼓励策略输出近零的mu指令
+    lambda_mu_reg = rc.get("lambda_mu_regularize", 0.0)
+    total_mu_reg = 0.0
+    if lambda_mu_reg > 0 and raw_actions is not None:
+        for i, off in enumerate(offensives):
+            if off.alive and not off.hit_hvt:
+                act = np.array(raw_actions[i], dtype=np.float32).flatten()
+                if len(act) >= 3:
+                    mu_pen = lambda_mu_reg * abs(act[2])
+                    rewards[i] -= mu_pen
+                    total_mu_reg += mu_pen
+    reward_info["penalty_mu_reg"] = total_mu_reg
 
     # ==========================================================
     # 安全惩罚 (仅保留物理安全: boundary + ground)

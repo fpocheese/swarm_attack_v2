@@ -162,24 +162,30 @@ DEFAULT_CONFIG = {
         "reassign_interval": 20,      # (保留字段但无效, reassign=False)
     },
 
-    # === V36 奖励: 修复dt=0.01信号缩放问题 ===
-    # V35问题: approach(0.045/step) << proximity(0.267/step@1000m) << closing(1.125/step)
-    # V36修复: 1)approach_norm 300→60(5x stronger) 2)proximity 0.4→0.1 3)closing 3.0→1.5
+    # === V37 奖励: 修复 '飞歪' 问题 ===
+    # V36诊断: Agent mu偏置0.04→航向漂移1.6°/s→50s偏80°
+    #   根因: 1)heading奖只用cos(err),小角度梯度≈0 2)closing独大 3)无mu正则化
+    # V37修复: 1)加heading_error平方惩罚 2)加mu正则化 3)大幅增强heading信号 4)降低closing
     "reward": {
         # --- 核心: 接近目标 ---
         "lambda_approach": 30.0,           # 距离减少奖励 (delta_rho/norm * lambda)
         "approach_norm_dist": 60.0,        # V36: 300→60 (dt=0.01步长0.45m, r_app=0.225/step)
-        "close_range_threshold": 500.0,    # 500m内开始放大
-        "close_range_max_multiplier": 10.0, # V36: 15→10 (避免近距梯度爆炸)
+        "close_range_threshold": 800.0,    # V37: 500→800 (更早开始放大接近奖励)
+        "close_range_max_multiplier": 10.0, # 放大倍率
 
-        # --- 核心: 航向对准 ---
-        "lambda_heading_align": 0.2,       # V36: 0.15→0.2 (稍强化航向信号)
+        # --- 核心: 航向对准 (V37大幅增强) ---
+        "lambda_heading_align": 0.5,       # V37: 0.2→0.5 (cos加成更强)
+        # V37新增: 航向误差平方惩罚 (小角度强梯度, 比cos有效得多)
+        "lambda_heading_error_penalty": 0.8, # penalty = λ * (err/π)², 30°偏航→-0.022/step
 
-        # --- 核心: 闭合速度 ---
-        "lambda_closing": 1.5,             # V36: 3.0→1.5 (原1.125/step→0.56/step, 不再压倒approach)
+        # --- 核心: 闭合速度 (V37削弱以停止主导) ---
+        "lambda_closing": 0.8,             # V37: 1.5→0.8 (不再是最强信号)
+
+        # --- V37新增: mu正则化 (防止无意义转弯) ---
+        "lambda_mu_regularize": 0.15,      # 惩罚|action[2]|, 鼓励直飞
 
         # --- 核心: 距离惩罚 (防止绕圈) ---
-        "lambda_proximity": 0.1,           # V36: 0.4→0.1 (@1000m: 0.067/step, 不再压倒approach)
+        "lambda_proximity": 0.15,          # V37: 0.1→0.15 (略增, 配合heading强化)
         "proximity_norm_dist": 1500.0,     # 归一化距离
 
         # --- 安全惩罚 (仅物理) ---
@@ -198,6 +204,19 @@ DEFAULT_CONFIG = {
         # --- 超时惩罚 (env.step直接引用, 必须保留) ---
         "timeout_penalty": -100.0,         # timeout基础惩罚
         "timeout_distance_penalty_coef": 1000.0, # 基于距离的timeout额外惩罚
+
+        # V37信号量级预估 (@1000m直飞, v=45m/s, heading_err=0):
+        #   approach: 30*0.45/60 = 0.225/step
+        #   heading_align: 0.5*cos(0) = 0.500/step
+        #   heading_err_pen: -0.8*(0/π)² = 0.000/step
+        #   closing: 0.8*45/120 = 0.300/step
+        #   mu_reg: -0.15*0 = 0.000/step
+        #   proximity: -0.15*1000/1500 = -0.100/step
+        #   NET: +0.925/step (直飞最优)
+        # @1000m, 30°偏航:
+        #   approach: 0.195, heading: 0.433, heading_pen: -0.022
+        #   closing: 0.260, mu_reg: -0.015, proximity: -0.100
+        #   NET: +0.751/step (-18.8% 相比直飞, V36仅-14%)
     },
 
     # V28: cost 全部并入 reward, 保留字段但不再使用
