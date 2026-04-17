@@ -1,7 +1,10 @@
-"""
-FOV Penetration Environment - Interceptor Policy V22
+"""FOV Penetration Environment - Interceptor Policy V22/V5
 ====================================================
-三维比例导引法 (3D PN) + 先入视场即锁定
+三维比例导引法 (3D PN) + 先入视场即锁定 + 排他锁定
+
+V5 动力学改动 (2026-04-08):
+    控制量从 (ax, ay, mu) 改为 (ax, an_pitch, an_yaw)
+    PN制导直接输出俯仰/偏航加速度, 无需合成步骤
 
 V22 核心改动 (2026-03-29):
     新增事件触发式锁定状态机:
@@ -20,7 +23,7 @@ from .config import G
 
 
 class InterceptorPolicy:
-    """基于 3D PN 的拦截器控制器 — V22 先入视场即锁定"""
+    """基于 3D PN 的拦截器控制器 — V5 惯性系加速度 + V22 排他锁定"""
 
     # 锁定状态
     STATE_INIT_GUIDE = 0   # 按初始目指飞行
@@ -63,8 +66,8 @@ class InterceptorPolicy:
         # 交战跟踪 (保留兼容)
         self.engagement_state = self.STATE_INIT_GUIDE
         self.tracking_steps = 0
-        self.demanded_ay = 0.0            # 法向加速度大小 (m/s²)
-        self.demanded_mu = 0.0            # 法向方向角
+        self.demanded_an_pitch = 0.0      # 俯仰加速度 (m/s²)
+        self.demanded_an_yaw = 0.0        # 偏航加速度 (m/s²)
         self.closing_speed = 0.0
         self.los_rate_az = 0.0
         self.los_rate_el = 0.0
@@ -110,8 +113,8 @@ class InterceptorPolicy:
         self.fov_loss_counter = 0
         self.engagement_state = self.STATE_INIT_GUIDE
         self.tracking_steps = 0
-        self.demanded_ay = 0.0
-        self.demanded_mu = 0.0
+        self.demanded_an_pitch = 0.0
+        self.demanded_an_yaw = 0.0
         self.closing_speed = 0.0
         self.los_rate_az = 0.0
         self.los_rate_el = 0.0
@@ -134,16 +137,21 @@ class InterceptorPolicy:
         """兼容旧接口: 等价于 set_initial_target"""
         self.set_initial_target(target_idx, target_aircraft)
 
-    def try_fov_lock(self, off_idx, offensive, current_step):
+    def try_fov_lock(self, off_idx, offensive, current_step, already_locked_offensives=None):
         """
         尝试视场触发锁定。
         当某架进攻飞行器首先进入该拦截器视场 → 立即锁定。
+        已被其他拦截器锁定的进攻方会被跳过，保证一对一分配。
 
         Returns:
             locked: bool, 是否发生了新锁定
         """
         if self.lock_mode in (self.STATE_LOCKED, self.STATE_MISSED, self.STATE_ABANDONED):
             return False  # 已经锁定过或已放弃
+
+        # 排他锁定: 已被其他拦截器锁定的进攻方不再锁定
+        if already_locked_offensives is not None and off_idx in already_locked_offensives:
+            return False
 
         intc = self.interceptor
         if not intc.alive or not offensive.alive:
@@ -174,9 +182,11 @@ class InterceptorPolicy:
 
         return False
 
-    def update_lock_state(self, offensives, current_step):
+    def update_lock_state(self, offensives, current_step, already_locked_offensives=None):
         """
         每步更新锁定状态 (在 env.step() 中调用)。
+        already_locked_offensives: 已被其他拦截器锁定的进攻方索引集合，
+                                   保证不会重复锁定同一目标。
 
         Returns:
             lock_event: dict or None (锁定/丢失事件)
@@ -185,13 +195,17 @@ class InterceptorPolicy:
         if not intc.alive:
             return None
 
-        # INIT_GUIDE 阶段: 扫描所有进攻方, 先入视场即锁定
+        if already_locked_offensives is None:
+            already_locked_offensives = set()
+
+        # INIT_GUIDE 阶段: 扫描所有进攻方, 先入视场即锁定 (排除已被锁定目标)
         if self.lock_mode == self.STATE_INIT_GUIDE:
             if self.lock_rules.get("enable_fov_trigger_lock", True):
                 for oi, off in enumerate(offensives):
                     if not off.alive or off.hit_hvt:
                         continue
-                    locked = self.try_fov_lock(oi, off, current_step)
+                    locked = self.try_fov_lock(oi, off, current_step,
+                                              already_locked_offensives)
                     if locked:
                         return {
                             "type": "fov_trigger_lock",
@@ -345,8 +359,8 @@ class InterceptorPolicy:
             abandon_dist = self.pursuit_cfg.get("passed_distance_abandon", 800.0)
             if dist > abandon_dist:
                 # 彻底放弃, 飞回HVT保护区
-                self.demanded_ay = 0.0
-                self.demanded_mu = 0.0
+                self.demanded_an_pitch = G
+                self.demanded_an_yaw = 0.0
                 return self._goto_hvt()
 
         # 信息更新 (FOV内高频, FOV外低频)
@@ -422,7 +436,7 @@ class InterceptorPolicy:
         ]
 
     def _pn_guidance_3d(self, tx, ty, tz, dt):
-        """3D比例导引 — V4: 输出 (ax_cmd, ay_cmd, mu_cmd)"""
+        """3D比例导引 — V5: 输出 (ax_cmd, an_pitch_cmd, an_yaw_cmd)"""
         intc = self.interceptor
         dx = tx - intc.x
         dy = ty - intc.y
@@ -470,18 +484,14 @@ class InterceptorPolicy:
         v_closing = -(dx * dvx + dy * dvy + dz * dvz) / r
         self.closing_speed = v_closing
 
-        # PN 加速度指令 (m/s², 不再是过载 G 单位)
-        # 水平方向 PN 校正加速度
-        a_h = self.N * v_closing * los_rate_az
-        # 垂直方向 PN 校正加速度 + 重力补偿
-        a_v = self.N * v_closing * los_rate_el + G * np.cos(intc.gamma)
+        # V5 PN 加速度指令 — 直接输出俯仰/偏航加速度
+        # 偏航方向 PN 校正加速度 (水平平面)
+        an_yaw_cmd = self.N * v_closing * los_rate_az
+        # 俯仰方向 PN 校正加速度 + 重力补偿 (垂直平面)
+        an_pitch_cmd = self.N * v_closing * los_rate_el + G * np.cos(intc.gamma)
 
-        # 合成为 (ay, mu)
-        ay_demanded = np.sqrt(a_h**2 + a_v**2)
-        mu_demanded = np.arctan2(a_v, a_h)
-
-        self.demanded_ay = ay_demanded
-        self.demanded_mu = mu_demanded
+        self.demanded_an_pitch = an_pitch_cmd
+        self.demanded_an_yaw = an_yaw_cmd
 
         # 轴向加速度: 重力补偿 + 微小前向加速
         ax_cmd = G * np.sin(intc.gamma) + 5.0
@@ -489,13 +499,13 @@ class InterceptorPolicy:
         # 饱和保护
         params = intc.params
         ax_cmd = np.clip(ax_cmd, params["ax_min"], params["ax_max"])
-        ay_cmd = np.clip(ay_demanded, 0.0, params["ay_max"])
-        mu_cmd = mu_demanded
+        an_pitch_cmd = np.clip(an_pitch_cmd, -params["an_pitch_max"], params["an_pitch_max"])
+        an_yaw_cmd = np.clip(an_yaw_cmd, -params["an_yaw_max"], params["an_yaw_max"])
 
-        return ax_cmd, ay_cmd, mu_cmd
+        return ax_cmd, an_pitch_cmd, an_yaw_cmd
 
     def _patrol_action(self):
-        """V4: 巡逻模式, 输出 (ax, ay, mu)"""
+        """V5: 巡逻模式, 输出 (ax, an_pitch, an_yaw)"""
         intc = self.interceptor
         px = self.hvt.x + self.patrol_offset_x
         py = self.hvt.y + self.patrol_offset_y
@@ -504,46 +514,43 @@ class InterceptorPolicy:
         dy = py - intc.y
         heading_err = np.arctan2(dy, dx) - intc.heading
         heading_err = np.arctan2(np.sin(heading_err), np.cos(heading_err))
-        # 水平校正加速度 (m/s²)
-        a_h = np.clip(2.0 * heading_err, -2.0, 2.0) * G
-        # 垂直校正加速度 (m/s²) + 重力补偿
+        # 偏航校正加速度 (m/s²)
+        an_yaw_cmd = np.clip(2.0 * heading_err, -2.0, 2.0) * G
+        # 俯仰校正加速度 (m/s²) + 重力补偿
         dz = pz - intc.z
-        a_v = np.clip(0.5 * dz / 100.0, -1.0, 1.0) * G + G * np.cos(intc.gamma)
-        # 合成
-        ay_cmd = np.sqrt(a_h**2 + a_v**2)
-        mu_cmd = np.arctan2(a_v, a_h)
+        an_pitch_cmd = np.clip(0.5 * dz / 100.0, -1.0, 1.0) * G + G * np.cos(intc.gamma)
         ax_cmd = G * np.sin(intc.gamma)  # 重力补偿, 巡航
         # 饱和
         params = intc.params
-        ay_cmd = np.clip(ay_cmd, 0.0, params["ay_max"])
+        an_pitch_cmd = np.clip(an_pitch_cmd, -params["an_pitch_max"], params["an_pitch_max"])
+        an_yaw_cmd = np.clip(an_yaw_cmd, -params["an_yaw_max"], params["an_yaw_max"])
         ax_cmd = np.clip(ax_cmd, params["ax_min"], params["ax_max"])
-        return ax_cmd, ay_cmd, mu_cmd
+        return ax_cmd, an_pitch_cmd, an_yaw_cmd
 
     def _goto_hvt(self):
-        """V4: 飞向HVT, 输出 (ax, ay, mu)"""
+        """V5: 飞向HVT, 输出 (ax, an_pitch, an_yaw)"""
         intc = self.interceptor
         dx = self.hvt.x - intc.x
         dy = self.hvt.y - intc.y
         heading_err = np.arctan2(dy, dx) - intc.heading
         heading_err = np.arctan2(np.sin(heading_err), np.cos(heading_err))
-        # 水平校正加速度 (m/s²)
-        a_h = np.clip(3.0 * heading_err, -4.0, 4.0) * G
-        # 垂直校正加速度 (m/s²) + 重力补偿
+        # 偏航校正加速度 (m/s²)
+        an_yaw_cmd = np.clip(3.0 * heading_err, -4.0, 4.0) * G
+        # 俯仰校正加速度 (m/s²) + 重力补偿
         dz = (self.hvt.z + 500.0) - intc.z
-        a_v = np.clip(0.5 * dz / 100.0, -1.0, 1.0) * G + G * np.cos(intc.gamma)
-        # 合成
-        ay_cmd = np.sqrt(a_h**2 + a_v**2)
-        mu_cmd = np.arctan2(a_v, a_h)
+        an_pitch_cmd = np.clip(0.5 * dz / 100.0, -1.0, 1.0) * G + G * np.cos(intc.gamma)
         ax_cmd = G * np.sin(intc.gamma) + 5.0  # 重力补偿 + 微小前向加速
         # 饱和
         params = intc.params
-        ay_cmd = np.clip(ay_cmd, 0.0, params["ay_max"])
+        an_pitch_cmd = np.clip(an_pitch_cmd, -params["an_pitch_max"], params["an_pitch_max"])
+        an_yaw_cmd = np.clip(an_yaw_cmd, -params["an_yaw_max"], params["an_yaw_max"])
         ax_cmd = np.clip(ax_cmd, params["ax_min"], params["ax_max"])
-        return ax_cmd, ay_cmd, mu_cmd
+        return ax_cmd, an_pitch_cmd, an_yaw_cmd
 
     def _pursuit_guidance_3d(self, tx, ty, tz):
         """
         目标后半球时的纯追踪制导
+        V5: 输出 (ax, an_pitch, an_yaw)
         V31: 飞越后大幅降低机动能力 (模拟真实导弹回头困难)
         """
         intc = self.interceptor
@@ -559,62 +566,64 @@ class InterceptorPolicy:
         # === V31: 飞越后机动能力退化 ===
         if self._target_passed:
             pcfg = self.pursuit_cfg
-            ay_fraction = pcfg.get("uturn_ay_fraction", 0.20)
+            accel_fraction = pcfg.get("uturn_ay_fraction", 0.20)
             recovery_steps = pcfg.get("uturn_recovery_steps", 500)
             ax_brake = pcfg.get("uturn_ax_brake", -8.0)
 
-            # 逐步恢复: 从 ay_fraction 线性恢复到 1.0
+            # 逐步恢复: 从 accel_fraction 线性恢复到 1.0
             steps_since_pass = max(self.tracking_steps - self._pass_step, 0)
             recovery_ratio = min(steps_since_pass / max(recovery_steps, 1), 1.0)
-            current_ay_fraction = ay_fraction + (1.0 - ay_fraction) * recovery_ratio
+            current_fraction = accel_fraction + (1.0 - accel_fraction) * recovery_ratio
 
-            # 限制 ay_max
-            ay_max_effective = params["ay_max"] * current_ay_fraction
+            # 限制加速度
+            an_pitch_max_eff = params["an_pitch_max"] * current_fraction
+            an_yaw_max_eff = params["an_yaw_max"] * current_fraction
 
             # 降低追踪增益 (回头更慢)
-            gain_h = 1.0 * current_ay_fraction   # 正常是 4.0
-            gain_v = 0.8 * current_ay_fraction    # 正常是 3.0
+            gain_h = 1.0 * current_fraction   # 正常是 4.0
+            gain_v = 0.8 * current_fraction   # 正常是 3.0
 
-            a_h = np.clip(gain_h * heading_err, -2.0, 2.0) * G
+            an_yaw_cmd = np.clip(gain_h * heading_err, -2.0, 2.0) * G
 
             horiz = max(np.sqrt(dx**2 + dy**2), 1.0)
             pitch_err = np.arctan2(dz, horiz) - intc.gamma
             pitch_err = np.arctan2(np.sin(pitch_err), np.cos(pitch_err))
-            a_v = np.clip(gain_v * pitch_err, -1.5, 1.5) * G + G * np.cos(intc.gamma)
-
-            ay_cmd = np.sqrt(a_h**2 + a_v**2)
-            mu_cmd = np.arctan2(a_v, a_h)
+            an_pitch_cmd = np.clip(gain_v * pitch_err, -1.5, 1.5) * G + G * np.cos(intc.gamma)
 
             # 飞越后减速 → 回头更困难, 速度优势消失
             ax_cmd = ax_brake
 
-            ay_cmd = np.clip(ay_cmd, 0.0, ay_max_effective)
+            an_pitch_cmd = np.clip(an_pitch_cmd, -an_pitch_max_eff, an_pitch_max_eff)
+            an_yaw_cmd = np.clip(an_yaw_cmd, -an_yaw_max_eff, an_yaw_max_eff)
             ax_cmd = np.clip(ax_cmd, params["ax_min"], params["ax_max"])
-            return ax_cmd, ay_cmd, mu_cmd
+            return ax_cmd, an_pitch_cmd, an_yaw_cmd
 
         # 正常追踪制导 (未飞越)
-        a_h = np.clip(4.0 * heading_err, -5.0, 5.0) * G
+        an_yaw_cmd = np.clip(4.0 * heading_err, -5.0, 5.0) * G
 
         horiz = max(np.sqrt(dx**2 + dy**2), 1.0)
         pitch_err = np.arctan2(dz, horiz) - intc.gamma
         pitch_err = np.arctan2(np.sin(pitch_err), np.cos(pitch_err))
-        a_v = np.clip(3.0 * pitch_err, -4.0, 4.0) * G + G * np.cos(intc.gamma)
+        an_pitch_cmd = np.clip(3.0 * pitch_err, -4.0, 4.0) * G + G * np.cos(intc.gamma)
 
-        ay_cmd = np.sqrt(a_h**2 + a_v**2)
-        mu_cmd = np.arctan2(a_v, a_h)
         ax_cmd = G * np.sin(intc.gamma)
 
-        ay_cmd = np.clip(ay_cmd, 0.0, params["ay_max"])
+        an_pitch_cmd = np.clip(an_pitch_cmd, -params["an_pitch_max"], params["an_pitch_max"])
+        an_yaw_cmd = np.clip(an_yaw_cmd, -params["an_yaw_max"], params["an_yaw_max"])
         ax_cmd = np.clip(ax_cmd, params["ax_min"], params["ax_max"])
-        return ax_cmd, ay_cmd, mu_cmd
+        return ax_cmd, an_pitch_cmd, an_yaw_cmd
 
     def is_overload_saturated(self):
         """
         检查当前PN要求的法向加速度是否超出拦截器极限
-        返回: (saturated, saturated, saturation_ratio)
+        返回: (pitch_saturated, yaw_saturated, max_saturation_ratio)
         """
         params = self.interceptor.params
-        ay_max = params["ay_max"]
-        ay_ratio = self.demanded_ay / max(ay_max, 0.1)
-        saturated = self.demanded_ay > ay_max
-        return saturated, saturated, ay_ratio
+        an_pitch_max = params["an_pitch_max"]
+        an_yaw_max = params["an_yaw_max"]
+        pitch_ratio = abs(self.demanded_an_pitch) / max(an_pitch_max, 0.1)
+        yaw_ratio = abs(self.demanded_an_yaw) / max(an_yaw_max, 0.1)
+        max_ratio = max(pitch_ratio, yaw_ratio)
+        pitch_sat = abs(self.demanded_an_pitch) > an_pitch_max
+        yaw_sat = abs(self.demanded_an_yaw) > an_yaw_max
+        return pitch_sat or yaw_sat, pitch_sat or yaw_sat, max_ratio

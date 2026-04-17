@@ -44,33 +44,35 @@ DEFAULT_CONFIG = {
     "n_offensive": 4,
     "n_defensive": 4,
 
-    # === 进攻飞行器参数 (V4动力学: ax/ay/mu控制) ===
+    # === 进攻飞行器参数 (V5动力学: ax/an_pitch/an_yaw控制) ===
     "offensive": {
         "v_min": 40.0,
         "v_nominal": 45.0,
         "v_max": 50.0,
         "ax_min": -5.0,          # m/s², 轴向减速下限
         "ax_max": 20.0,          # m/s², 轴向加速上限
-        "ay_max": 2.5 * G,       # m/s², 法向过载 n_max=2.5
+        "an_pitch_max": 2.5 * G, # m/s², 俯仰平面法向加速度限幅 n_max=2.5
+        "an_yaw_max": 2.5 * G,   # m/s², 偏航平面法向加速度限幅 n_max=2.5
         "dax_max": 60.0,         # m/s³, 轴向加速度变化率
-        "day_max": 120.0,        # m/s³, 法向加速度变化率
-        "dmu_max": 30.0,         # rad/s, 法向方向角变化率
+        "dan_pitch_max": 120.0,  # m/s³, 俯仰加速度变化率
+        "dan_yaw_max": 120.0,    # m/s³, 偏航加速度变化率
         "gamma_min": np.deg2rad(-15.0),
         "gamma_max": np.deg2rad(15.0),
         "action_scale": 1.0,     # V24fix: 0.5→1.0, 恢复全机动能力
     },
 
-    # === 防御/拦截器参数 (V4动力学: ax/ay/mu控制) ===
+    # === 防御/拦截器参数 (V5动力学: ax/an_pitch/an_yaw控制) ===
     "defensive": {
         "v_min": 50.0,
         "v_nominal": 55.0,
         "v_max": 60.0,
         "ax_min": -10.0,         # m/s², 轴向减速下限
         "ax_max": 30.0,          # m/s², 轴向加速上限
-        "ay_max": 5.0 * G,       # m/s², 法向过载 n_max=5.0 (约为进攻方两倍)
+        "an_pitch_max": 5.0 * G, # m/s², 俯仰平面法向加速度限幅 (约为进攻方两倍)
+        "an_yaw_max": 5.0 * G,   # m/s², 偏航平面法向加速度限幅
         "dax_max": 80.0,         # m/s³, 轴向加速度变化率
-        "day_max": 150.0,        # m/s³, 法向加速度变化率
-        "dmu_max": 50.0,         # rad/s, 法向方向角变化率
+        "dan_pitch_max": 150.0,  # m/s³, 俯仰加速度变化率
+        "dan_yaw_max": 150.0,    # m/s³, 偏航加速度变化率
         "gamma_min": np.deg2rad(-45.0),
         "gamma_max": np.deg2rad(45.0),
     },
@@ -328,7 +330,7 @@ DEFAULT_CONFIG = {
 
     # === 点目标命中配置 ===
     "point_target": {
-        "hit_threshold": 50.0,                 # V33: 30m→50m, 训练早期更容易触发命中奖励
+        "hit_threshold": 5.0,                  # V38: 50→5m, 与拦截器碰撞阈值对称(脱靶量<5m即命中)
         "record_miss_distance": True,          # 逐步记录脱靶量
     },
 

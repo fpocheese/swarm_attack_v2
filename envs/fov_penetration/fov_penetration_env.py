@@ -362,8 +362,8 @@ class FOVPenetrationEnv:
         for i, policy in enumerate(self.defensive_policies):
             d = self.defensives[i]
             if d.alive:
-                ax_cmd, ay_cmd, mu_cmd = policy.get_action(self.offensives, self.dt)
-                d.step(ax_cmd, ay_cmd, mu_cmd, self.dt)
+                ax_cmd, an_pitch_cmd, an_yaw_cmd = policy.get_action(self.offensives, self.dt)
+                d.step(ax_cmd, an_pitch_cmd, an_yaw_cmd, self.dt)
 
         # 3. 更新探测状态
         self._update_detection()
@@ -382,12 +382,23 @@ class FOVPenetrationEnv:
                            for i in range(self.n_defensive)]
 
         # 6. V22: 每步更新拦截器锁定状态 (FOV触发锁定)
+        #    V38: 排他锁定 — 已被锁定的进攻方不允许被其他拦截器重复锁定
         step_lock_events = []
+        already_locked_offensives = set()
+        # 先收集当前已被锁定的进攻方
+        for di, policy in enumerate(self.defensive_policies):
+            if (policy.lock_mode == InterceptorPolicy.STATE_LOCKED
+                    and policy.current_locked_target_idx is not None):
+                already_locked_offensives.add(policy.current_locked_target_idx)
         for di, policy in enumerate(self.defensive_policies):
             if self.defensives[di].alive:
                 lock_ev = policy.update_lock_state(
-                    self.offensives, self.current_step)
+                    self.offensives, self.current_step,
+                    already_locked_offensives=already_locked_offensives)
                 if lock_ev is not None:
+                    # 新锁定成功，加入已锁定集合
+                    if lock_ev.get("type") == "fov_trigger_lock":
+                        already_locked_offensives.add(lock_ev["off_idx"])
                     step_lock_events.append(lock_ev)
                     self.lock_events_log.append(lock_ev)
 
@@ -924,7 +935,7 @@ class FOVPenetrationEnv:
                 agent.heading / np.pi,           # self_heading
                 agent.gamma / (np.pi / 4),       # self_gamma
                 agent.ax / 20.0,                 # self_ax
-                agent.ay / 25.0,                 # self_ay
+                agent.an_yaw / 25.0,             # self_an_yaw (V5)
                 1.0 if agent.locked_by_count > 0 else 0.0,  # is_locked
                 agent.locked_by_count / max(self.n_defensive, 1),  # locked_by_count
             ])
@@ -1117,7 +1128,7 @@ class FOVPenetrationEnv:
                 off.x / obs_range, off.y / obs_range, off.z / z_range,
                 off.v / vel_range, off.heading / np.pi,
                 off.gamma / (np.pi / 4),
-                off.ax / 20.0, off.ay / 25.0, off.mu / np.pi,
+                off.ax / 20.0, off.an_pitch / 25.0, off.an_yaw / 25.0,
                 float(off.alive),
             ])
         for d in self.defensives:

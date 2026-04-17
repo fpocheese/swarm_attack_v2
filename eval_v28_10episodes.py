@@ -190,7 +190,7 @@ def save_plots(results, out_dir: Path):
     plt.close(fig)
 
 
-def render_policy_gif(env, policies, out_path: Path, device, hidden_size=64, fps=8, stride=20, max_frames=250):
+def render_policy_gif(env, policies, out_path: Path, device, hidden_size=64, fps=10, stride=20, max_frames=500):
     try:
         import imageio.v2 as imageio
         use_imageio = True

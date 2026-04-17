@@ -254,7 +254,12 @@ class MujocoRunner(Runner):
                     one_episode_rewards[eval_i] = []
 
             if eval_episode >= self.all_args.eval_episodes:
-                eval_episode_rewards = np.concatenate(eval_episode_rewards)
+                # Flatten: collect all scalar episode rewards from all threads
+                _all_rewards = []
+                for _thread_rewards in eval_episode_rewards:
+                    for _r in _thread_rewards:
+                        _all_rewards.append(float(np.sum(_r)))
+                eval_episode_rewards = np.array(_all_rewards)
                 eval_env_infos = {'eval_average_episode_rewards': eval_episode_rewards,
                                   'eval_max_episode_rewards': [np.max(eval_episode_rewards)]}
                 self.log_env(eval_env_infos, total_num_steps)

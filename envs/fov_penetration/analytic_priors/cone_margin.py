@@ -87,9 +87,10 @@ def compute_Z_ij(q_ij: float, q_dot_ij: float, t_go: float,
 def compute_equivalent_normal_accel(entity) -> float:
     """Approximate equivalent normal acceleration magnitude (m/s^2).
 
-    V4动力学: entity.ay 即为法向加速度大小, 直接返回。
+    V5动力学: entity.an_pitch 和 entity.an_yaw 分别是俯仰和偏航法向加速度,
+    合成为等效法向加速度大小。
     """
-    return entity.ay
+    return np.sqrt(entity.an_pitch**2 + entity.an_yaw**2)
 
 
 # -----------------------------------------------------------------------

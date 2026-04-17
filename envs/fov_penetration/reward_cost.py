@@ -192,9 +192,9 @@ def compute_rewards(offensives, defensives, hvt, config,
     reward_info["penalty_proximity"] = total_prox
 
     # ==========================================================
-    # V37新增: mu正则化 (防止无意义转弯)
+    # V37/V5: 偏航加速度正则化 (防止无意义转弯)
     # ==========================================================
-    # 惩罚|action[2]| — 鼓励策略输出近零的mu指令
+    # 惩罚|action[2]| — 鼓励策略输出近零的偏航指令
     lambda_mu_reg = rc.get("lambda_mu_regularize", 0.0)
     total_mu_reg = 0.0
     if lambda_mu_reg > 0 and raw_actions is not None:
@@ -202,10 +202,10 @@ def compute_rewards(offensives, defensives, hvt, config,
             if off.alive and not off.hit_hvt:
                 act = np.array(raw_actions[i], dtype=np.float32).flatten()
                 if len(act) >= 3:
-                    mu_pen = lambda_mu_reg * abs(act[2])
-                    rewards[i] -= mu_pen
-                    total_mu_reg += mu_pen
-    reward_info["penalty_mu_reg"] = total_mu_reg
+                    yaw_pen = lambda_mu_reg * abs(act[2])
+                    rewards[i] -= yaw_pen
+                    total_mu_reg += yaw_pen
+    reward_info["penalty_yaw_reg"] = total_mu_reg
 
     # ==========================================================
     # 安全惩罚 (仅保留物理安全: boundary + ground)
