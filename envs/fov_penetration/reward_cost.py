@@ -1,4 +1,4 @@
-"""FOV Penetration Environment - Reward & Cost V37
+"""FOV Penetration Environment - Reward & Cost V38
 ===================================================
 V37: 修复 '飞歪' 问题 — 强化航向修正, 抑制mu偏置
 
@@ -61,7 +61,7 @@ def _closing_speed_to_point_correct(off, px, py, pz):
 
 
 # ======================================================================
-# Main: compute_rewards V35 — 极简目标优先
+# Main: compute_rewards V38 — 目标优先 + 终端命中友好
 # ======================================================================
 def compute_rewards(offensives, defensives, hvt, config,
                     prev_dists_to_hvt, hit_events, current_step,
@@ -72,7 +72,10 @@ def compute_rewards(offensives, defensives, hvt, config,
                     ap_data=None,
                     raw_actions=None):
     """
-    V35 极简奖励: 只关心 '接近目标' 和 '面朝目标'.
+        V38 奖励:
+            1) 强化朝向HVT的 2D/3D 几何一致性
+            2) 显式惩罚回头远离目标
+            3) 增加团队最小距离进度奖励, 直接优化“至少一机突防”
     """
     rc = config["reward"]
     n_off = len(offensives)
@@ -94,6 +97,7 @@ def compute_rewards(offensives, defensives, hvt, config,
             cur_dists.append(off.distance_to(hvt_x, hvt_y, hvt_z))
         else:
             cur_dists.append(float('inf'))
+    closing_speeds = [0.0] * n_off
 
     # ==========================================================
     # 核心奖励 1: 距离减少奖励 (approach_reward)
@@ -143,6 +147,24 @@ def compute_rewards(offensives, defensives, hvt, config,
     reward_info["reward_heading_align"] = total_heading
 
     # ==========================================================
+    # 核心奖励 2b: 俯仰对准HVT (gamma_alignment)
+    # ==========================================================
+    lambda_gamma = rc.get("lambda_gamma_align", 0.25)
+    total_gamma = 0.0
+    for i, off in enumerate(offensives):
+        if off.alive and not off.hit_hvt:
+            dx = hvt_x - off.x
+            dy = hvt_y - off.y
+            horiz = max(np.sqrt(dx * dx + dy * dy), 1e-3)
+            desired_gamma = np.arctan2(hvt_z - off.z, horiz)
+            gamma_err = desired_gamma - off.gamma
+            gamma_err = (gamma_err + np.pi) % (2 * np.pi) - np.pi
+            r_gamma = lambda_gamma * np.cos(gamma_err)
+            rewards[i] += r_gamma
+            total_gamma += r_gamma
+    reward_info["reward_gamma_align"] = total_gamma
+
+    # ==========================================================
     # V37新增: 航向误差平方惩罚 (heading_error_penalty)
     # ==========================================================
     # cos(err)在小角度梯度≈0, 而(err/π)²在任何角度都有强梯度
@@ -171,11 +193,26 @@ def compute_rewards(offensives, defensives, hvt, config,
     for i, off in enumerate(offensives):
         if off.alive and not off.hit_hvt:
             Vc = _closing_speed_to_point_correct(off, hvt_x, hvt_y, hvt_z)
+            closing_speeds[i] = Vc
             # 正闭合速度 → 奖励, 负闭合速度 → 惩罚
             r_close = lambda_closing * Vc / vel_range
             rewards[i] += r_close
             total_closing += r_close
     reward_info["reward_closing_speed"] = total_closing
+
+    # ==========================================================
+    # 核心惩罚: 反回头惩罚 (no_retreat)
+    # ==========================================================
+    # 用负闭合速度直接惩罚“远离目标”，比距离差分更稳定
+    lambda_no_retreat = rc.get("lambda_no_retreat", 1.2)
+    retreat_speed_ref = max(rc.get("retreat_speed_ref", 35.0), 1.0)
+    total_retreat = 0.0
+    for i, off in enumerate(offensives):
+        if off.alive and not off.hit_hvt:
+            retreat_pen = lambda_no_retreat * max(-closing_speeds[i], 0.0) / retreat_speed_ref
+            rewards[i] -= retreat_pen
+            total_retreat += retreat_pen
+    reward_info["penalty_no_retreat"] = total_retreat
 
     # ==========================================================
     # 核心惩罚: 距离惩罚 (proximity_penalty)
@@ -192,17 +229,38 @@ def compute_rewards(offensives, defensives, hvt, config,
     reward_info["penalty_proximity"] = total_prox
 
     # ==========================================================
+    # 团队奖励: 队伍最小距离进度 (team_min_progress)
+    # ==========================================================
+    # 直接奖励“至少有人持续接近目标”，减少全队绕飞局部最优
+    lambda_team_progress = rc.get("lambda_team_min_progress", 0.0)
+    total_team_progress = 0.0
+    team_dists = [d for d in cur_dists if np.isfinite(d)]
+    if lambda_team_progress > 0.0 and prev_team_min_dist is not None and team_dists:
+        team_min_dist = min(team_dists)
+        delta_team = prev_team_min_dist - team_min_dist
+        team_r = lambda_team_progress * delta_team / max(approach_norm, 1.0)
+        for i, off in enumerate(offensives):
+            if off.alive and not off.hit_hvt:
+                rewards[i] += team_r
+                total_team_progress += team_r
+    reward_info["reward_team_min_progress"] = total_team_progress
+
+    # ==========================================================
     # V37/V5: 偏航加速度正则化 (防止无意义转弯)
     # ==========================================================
     # 惩罚|action[2]| — 鼓励策略输出近零的偏航指令
     lambda_mu_reg = rc.get("lambda_mu_regularize", 0.0)
+    yaw_reg_relax_dist = max(rc.get("yaw_reg_relax_dist", 350.0), 1.0)
+    yaw_reg_near_factor = np.clip(rc.get("yaw_reg_near_factor", 0.2), 0.0, 1.0)
     total_mu_reg = 0.0
     if lambda_mu_reg > 0 and raw_actions is not None:
         for i, off in enumerate(offensives):
             if off.alive and not off.hit_hvt:
                 act = np.array(raw_actions[i], dtype=np.float32).flatten()
                 if len(act) >= 3:
-                    yaw_pen = lambda_mu_reg * abs(act[2])
+                    dist_scale = np.clip(cur_dists[i] / yaw_reg_relax_dist,
+                                         yaw_reg_near_factor, 1.0)
+                    yaw_pen = lambda_mu_reg * abs(act[2]) * dist_scale
                     rewards[i] -= yaw_pen
                     total_mu_reg += yaw_pen
     reward_info["penalty_yaw_reg"] = total_mu_reg

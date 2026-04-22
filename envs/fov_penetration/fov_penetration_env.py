@@ -68,6 +68,7 @@ class FOVPenetrationEnv:
         self._seed = None
         self.rng = np.random.RandomState()
         self.prev_dists_to_hvt = []
+        self.initial_dists_to_hvt = []
         self.hit_count = 0
         self.hit_indices = []
         self.kill_events = []
@@ -269,6 +270,7 @@ class FOVPenetrationEnv:
             off.distance_to(self.hvt.x, self.hvt.y, self.hvt.z)
             for off in self.offensives
         ]
+        self.initial_dists_to_hvt = [max(d, 1.0) for d in self.prev_dists_to_hvt]
         self.prev_team_min_dist = min(self.prev_dists_to_hvt)
         self.hit_count = 0
         self.hit_indices = []
@@ -876,9 +878,9 @@ class FOVPenetrationEnv:
         设计理念: 打击目标是首要信息, HVT相关obs放在最前面最显著位置
         让飞行器知道: 队友在吸引火力 → 自己应该专心突入
 
-        1. Self State (10):
-           self_rel_goal_x/y/z, self_speed, self_heading, self_gamma,
-           self_ax, self_ay, is_locked, locked_by_count
+          1. Self State (10):
+              self_rel_goal_x/y/z, self_speed, self_heading, self_gamma,
+              self_an_pitch, self_an_yaw, is_locked, locked_by_count
 
         2. HVT Target Guidance (8) — V35扩展:
            rho_to_hvt, closing_speed_to_hvt, omega_hvt_los,
@@ -934,7 +936,7 @@ class FOVPenetrationEnv:
                 agent.v / vel_range,             # self_speed
                 agent.heading / np.pi,           # self_heading
                 agent.gamma / (np.pi / 4),       # self_gamma
-                agent.ax / 20.0,                 # self_ax
+                agent.an_pitch / 25.0,           # self_an_pitch (V5)
                 agent.an_yaw / 25.0,             # self_an_yaw (V5)
                 1.0 if agent.locked_by_count > 0 else 0.0,  # is_locked
                 agent.locked_by_count / max(self.n_defensive, 1),  # locked_by_count
@@ -957,8 +959,9 @@ class FOVPenetrationEnv:
             # 归一化到 [-pi, pi]
             heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
 
-            # V35新增: distance_progress — 当前距离占初始距离的比例
-            init_dist_estimate = obs_range  # 初始通常在obs_range附近
+            # V35新增: distance_progress — 当前距离占自身初始距离的比例
+            init_dist_estimate = self.initial_dists_to_hvt[ai] if ai < len(self.initial_dists_to_hvt) else obs_range
+            init_dist_estimate = max(init_dist_estimate, 1.0)
             # V36fix: rho_hvt=0 means dead/hit, use actual distance for alive agents
             if rho_hvt > 0:
                 dist_progress = rho_hvt / init_dist_estimate

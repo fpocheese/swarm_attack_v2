@@ -177,6 +177,7 @@ DEFAULT_CONFIG = {
 
         # --- 核心: 航向对准 (V37大幅增强) ---
         "lambda_heading_align": 0.5,       # V37: 0.2→0.5 (cos加成更强)
+        "lambda_gamma_align": 0.3,         # V38: 俯仰对准HVT，避免高空平飞绕圈
         # V37新增: 航向误差平方惩罚 (小角度强梯度, 比cos有效得多)
         "lambda_heading_error_penalty": 0.8, # penalty = λ * (err/π)², 30°偏航→-0.022/step
 
@@ -185,6 +186,13 @@ DEFAULT_CONFIG = {
 
         # --- V37新增: mu正则化 (防止无意义转弯) ---
         "lambda_mu_regularize": 0.15,      # 惩罚|action[2]|, 鼓励直飞
+        "yaw_reg_relax_dist": 350.0,       # V38: 距HVT近时自动放松偏航正则
+        "yaw_reg_near_factor": 0.2,        # V38: 最近端只保留20%偏航正则
+
+        # --- V38新增: 反回头与团队推进 ---
+        "lambda_no_retreat": 1.2,          # 惩罚负闭合速度(远离HVT)
+        "retreat_speed_ref": 35.0,         # 反回头归一化速度
+        "lambda_team_min_progress": 6.0,   # 奖励队伍最小距离持续下降
 
         # --- 核心: 距离惩罚 (防止绕圈) ---
         "lambda_proximity": 0.15,          # V37: 0.1→0.15 (略增, 配合heading强化)
@@ -196,7 +204,7 @@ DEFAULT_CONFIG = {
 
         # --- 被杀/命中 ---
         "killed_penalty": -0.5,            # 被杀几乎不罚 → 鼓励勇敢突入
-        "hit_hvt_bonus": 8000.0,           # 命中巨额奖 (V34:6000→8000)
+        "hit_hvt_bonus": 6000.0,           # V38: 降低方差, 仍保持强命中驱动
         "step_penalty": -0.003,            # 微弱步惩罚
 
         # --- 终端奖励 (V35简化) ---
@@ -204,8 +212,8 @@ DEFAULT_CONFIG = {
         "lambda_terminal_dist": 500.0,     # 距离终端奖 (越近越好)
 
         # --- 超时惩罚 (env.step直接引用, 必须保留) ---
-        "timeout_penalty": -100.0,         # timeout基础惩罚
-        "timeout_distance_penalty_coef": 1000.0, # 基于距离的timeout额外惩罚
+        "timeout_penalty": -120.0,         # V38: 增加超时惩罚, 抑制保守拖时
+        "timeout_distance_penalty_coef": 1200.0, # V38: 加强超时距离惩罚
 
         # V37信号量级预估 (@1000m直飞, v=45m/s, heading_err=0):
         #   approach: 30*0.45/60 = 0.225/step
