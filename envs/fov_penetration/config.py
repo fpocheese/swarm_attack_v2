@@ -178,7 +178,9 @@ DEFAULT_CONFIG = {
         "close_range_max_multiplier": 10.0,
 
         # --- 核心: 航向对准 ---
-        "lambda_heading_align": 0.3,
+        # V45: 0.3→0.05 杀掉 spawn-heading 直对 HVT 时 trim 白嫖 +0.3/step,
+        # heading 仍由 lambda_heading_error_penalty=0.2 兜底
+        "lambda_heading_align": 0.05,
         "lambda_gamma_align": 0.2,
         "lambda_heading_error_penalty": 0.2,
 
