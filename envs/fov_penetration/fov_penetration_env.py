@@ -129,32 +129,38 @@ class FOVPenetrationEnv:
         self._ap_prev_E_esc = None
 
     def _compute_space_dims(self):
-        """V35 观测空间: 目标优先 (Target-First)
-        1. Self State:                  10
-        2. HVT Target Guidance (扩展):    8  (+heading_error, dist_ratio, teammate_cover)
-        3. Top-2 Threat Interceptors:   6*2 = 12  (精简: 去掉Gamma/Xi/Z)
-        4. Team Situation:               4  (精简: 队友锁定/自由 + team_score + 存活比)
-        5. Analytic Prior Summary:       2  (仅P_pen, P_hit)
-        6. Time feature:                 1
-        Total: 37
+        """V41 观测空间: 理论驱动 (Theory-Grounded), 全部相对量/理论量, 无绝对位置.
+
+        理论依据 (newswarm.tex):
+          - 拦截器: q_ij (FOV锥裕度), V_c_ij (闭合速度), |omega_LOS_ij| (视线角速度),
+                   Gamma_ij = |omega_LOS| - a_max/V_j (跟踪失配裕度), is_locking_me
+          - HVT:    LOS azimuth/elevation rate (dλ_az/dt, dλ_el/dt) + V_c + heading-LOS alignment cos
+                   (PN 制导核心: dλ/dt 指明应施加的横/纵向加速度方向; cos 给纯方向引导, 不含距离)
+          - 群体:   被锁定队友数 (注意力转移 m_local), P_pen_i, P_hit_i (理论先验)
+
+        分块:
+          1. Self kinematic (5):   v, sin/cos(gamma), an_pitch, an_yaw   — 无绝对位置
+          2. HVT guidance (4):     dλ_az/dt, dλ_el/dt, V_c_HVT, cos(heading, r_iH)
+          3. Top-K threats (5*K):  q_ij, V_c_ij, |omega_LOS_ij|, Gamma_ij, is_locking_me
+          4. Team & priors (3):    n_mates_drawing_fire, P_pen_i, P_hit_i
+          5. Time (1):             t/T
+        Total (K=2): 5 + 4 + 10 + 3 + 1 = 23
         """
         cfg = self.config
         n_off = cfg["n_offensive"]
         self.obs_k_def = min(cfg["n_defensive"], 4)
 
-        # V35 观测维度 — 目标优先
-        self._dim_self = 10
-        self._dim_hvt_guidance = 8   # V35: 5→8, 新增heading_error, dist_progress, teammate_cover
-        self._dim_per_threat = 6     # V35: 9→6, 去掉Gamma, Xi, Z (太抽象)
+        self._dim_self = 5
+        self._dim_hvt_guidance = 4
+        self._dim_per_threat = 5      # q_ij, V_c, |omega|, Gamma, is_locking
         self._n_top_threats = 2
-        self._dim_threats = self._dim_per_threat * self._n_top_threats  # 12
-        self._dim_team_game = 4      # V35: 6→4, 去掉decoy/penetrator角色
-        self._dim_priors = 2         # V35: 5→2, 仅P_pen, P_hit
+        self._dim_threats = self._dim_per_threat * self._n_top_threats  # 10
+        self._dim_team_priors = 3     # n_mates_drawing_fire, P_pen, P_hit
         self._dim_time = 1
 
         self.obs_dim = (self._dim_self + self._dim_hvt_guidance
-                        + self._dim_threats + self._dim_team_game
-                        + self._dim_priors + self._dim_time)  # 37
+                        + self._dim_threats + self._dim_team_priors
+                        + self._dim_time)  # 23
 
         # share obs: 所有进攻方 10维 + 所有防御方 7维 + HVT 3维 + global 5维 + team_pen 1维
         self.share_obs_dim = 10 * n_off + 7 * cfg["n_defensive"] + 3 + 5 + 1
@@ -873,125 +879,101 @@ class FOVPenetrationEnv:
 
     def _get_obs(self):
         """
-        V35 观测空间 — "目标优先" (Target-First) 总维度 37
+        V41 观测空间 — 理论驱动 (Theory-Grounded), 总维度 22.
 
-        设计理念: 打击目标是首要信息, HVT相关obs放在最前面最显著位置
-        让飞行器知道: 队友在吸引火力 → 自己应该专心突入
+        设计原则 (来自 newswarm.tex):
+          1. 不使用任何绝对位置 — 全部相对量、视线量、闭合速度等理论物理量
+          2. HVT 不给相对位置, 只给 LOS 角速度+闭合速度 → 引导 agent 学 PN 制导
+          3. 拦截器侧用 tex 中的 q_ij (FOV锥裕度), Γ_ij (跟踪失配裕度) 等理论核心量
+          4. 群体先验 P_pen_i, P_hit_i 作为辅助观测 (tex 4.1 节)
 
-          1. Self State (10):
-              self_rel_goal_x/y/z, self_speed, self_heading, self_gamma,
-              self_an_pitch, self_an_yaw, is_locked, locked_by_count
-
-        2. HVT Target Guidance (8) — V35扩展:
-           rho_to_hvt, closing_speed_to_hvt, omega_hvt_los,
-           omega_hvt_los_dot, pn_hint_to_hvt,
-           heading_error_to_hvt,     # 新增: 机头朝向与目标方向的夹角
-           distance_progress,        # 新增: 当前距离/初始距离 (进度指标)
-           teammates_drawing_fire    # 新增: 有多少队友正在吸引拦截器火力
-
-        3. Top-2 Threat Interceptors (6*2=12) — V35精简:
-           每个: rho, closing_speed, bearing_error, in_fov, is_locking_me,
-                 omega_los  (去掉Gamma/Xi/Z, 太抽象agent学不到)
-
-        4. Team Situation (4) — V35精简:
-           n_teammates_locked, n_teammates_free,
-           team_effective_penetration_score,
-           n_alive_ratio
-
-        5. Target Priority (2):
-           P_pen_i, P_hit_i  (仅保留最重要的两个)
-
-        6. Time (1):
-           time_ratio
+        分块:
+          1. Self kinematic (5):  v, sin(gamma), cos(gamma), an_pitch, an_yaw
+          2. HVT guidance (3):    omega_LOS_pitch_iH, omega_LOS_yaw_iH, V_c_iH
+                                  (tex P_hit 公式中的 omega 与 V_c, ρ 不给以避免靠位置硬背)
+          3. Top-K threats (5*2): per interceptor:
+              q_ij        — FOV 锥裕度 (tex 公式 q_ij)
+              V_c_ij      — 闭合速度
+              |ω_LOS_ij|  — 视线角速度模长 (tex 局部逃逸机理核心)
+              Γ_ij        — 跟踪失配裕度 = |ω_LOS|·V_j / a_j_max - 1 (归一化)
+              is_locking_me — 是否锁定我 (来自拦截器状态机)
+          4. Team & priors (3):   n_mates_drawing_fire / (N-1), P_pen_i, P_hit_i
+          5. Time (1):            t/T
         """
         cfg = self.config
-        obs_range = max(cfg["obs_range"], 1.0)
         vel_range = max(cfg["vel_range"], 1.0)
-        z_range = max(cfg.get("z_range", 1000.0), 1.0)
         fov_half = cfg["fov_half_angle"]
-        det_range = cfg["detection_range"]
 
         hvt_x, hvt_y, hvt_z = self.hvt.x, self.hvt.y, self.hvt.z
 
         # 预计算
-        decoy_info = self._ap_decoy_info
         pen_info = self._ap_pen_info
-        esc_info = self._ap_esc_info
         hvt_info = self._ap_hvt_info
+
+        # 拦截器最大法向加速度 (用于 Gamma_ij)
+        a_def_max = cfg["defensive"].get("an_pitch_max", 5.0 * 9.81)
+
+        omega_norm = 0.5    # 角速度归一化 (rad/s)
+        an_norm = 25.0      # 加速度归一化 (m/s^2)
 
         obs_list = []
         for ai, agent in enumerate(self.offensives):
             obs = []
 
             # ============================================
-            # 1. Self State (10)
+            # 1. Self kinematic (5) — 仅自身飞行状态, 无任何绝对位置
             # ============================================
-            rel_x = (hvt_x - agent.x) / obs_range
-            rel_y = (hvt_y - agent.y) / obs_range
-            rel_z = (hvt_z - agent.z) / z_range
             obs.extend([
-                rel_x,              # self_rel_goal_x
-                rel_y,              # self_rel_goal_y
-                rel_z,              # self_rel_goal_z
-                agent.v / vel_range,             # self_speed
-                agent.heading / np.pi,           # self_heading
-                agent.gamma / (np.pi / 4),       # self_gamma
-                agent.an_pitch / 25.0,           # self_an_pitch (V5)
-                agent.an_yaw / 25.0,             # self_an_yaw (V5)
-                1.0 if agent.locked_by_count > 0 else 0.0,  # is_locked
-                agent.locked_by_count / max(self.n_defensive, 1),  # locked_by_count
+                agent.v / vel_range,
+                np.sin(agent.gamma),
+                np.cos(agent.gamma),
+                np.clip(agent.an_pitch / an_norm, -1.0, 1.0),
+                np.clip(agent.an_yaw / an_norm, -1.0, 1.0),
             ])
 
             # ============================================
-            # 2. HVT Target Guidance (8) — V35扩展
+            # 2. HVT guidance (3) — 仅 LOS 角速度 (pitch/yaw 分量) + 闭合速度
+            #    引导 agent 学会 PN 制导: 减小 LOS rate 即可命中
             # ============================================
-            rho_hvt = hvt_info.get("rho_per_agent", [0.0] * self.n_offensive)[ai]
-            closing_hvt = hvt_info.get("closing_per_agent", [0.0] * self.n_offensive)[ai]
-            omega_hvt = hvt_info.get("omega_per_agent", [0.0] * self.n_offensive)[ai]
-            omega_dot_hvt = hvt_info.get("omega_dot_per_agent", [0.0] * self.n_offensive)[ai]
-            pn_hint_hvt = hvt_info.get("pn_hint_per_agent", [0.0] * self.n_offensive)[ai]
-
-            # V35新增: heading_error_to_hvt — 机头朝向与目标连线的夹角
-            dx = hvt_x - agent.x
-            dy = hvt_y - agent.y
-            bearing_to_hvt = np.arctan2(dy, dx)
-            heading_error = bearing_to_hvt - agent.heading
-            # 归一化到 [-pi, pi]
-            heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
-
-            # V35新增: distance_progress — 当前距离占自身初始距离的比例
-            init_dist_estimate = self.initial_dists_to_hvt[ai] if ai < len(self.initial_dists_to_hvt) else obs_range
-            init_dist_estimate = max(init_dist_estimate, 1.0)
-            # V36fix: rho_hvt=0 means dead/hit, use actual distance for alive agents
-            if rho_hvt > 0:
-                dist_progress = rho_hvt / init_dist_estimate
-            elif agent.alive and not agent.hit_hvt:
-                # Fallback: compute directly (handles first step if hvt_info incomplete)
-                dist_progress = agent.distance_to(hvt_x, hvt_y, hvt_z) / init_dist_estimate
+            if agent.alive and not agent.hit_hvt:
+                v_off = self._vel3d(agent)
+                r_iH = np.array([hvt_x - agent.x, hvt_y - agent.y, hvt_z - agent.z])
+                rho_iH = float(np.linalg.norm(r_iH))
+                rho_safe = max(rho_iH, 1.0)
+                # 闭合速度 V_c = -dρ/dt = (r·v)/ρ  (HVT 静止)
+                vc_iH = float(np.dot(r_iH, v_off) / rho_safe)
+                # LOS 角速度 (方位角速率 + 俯仰角速率), 用解析公式从 r, v 直接算
+                #   λ_az = atan2(r_y, r_x)        ⇒  dλ_az/dt = (r_x v_y - r_y v_x) / (r_x² + r_y²)
+                #   λ_el = asin(r_z / ρ)          ⇒  dλ_el/dt = (v_z * ρ_h² - r_z * (r_x v_x + r_y v_y))
+                #                                                / (ρ² * ρ_h)
+                rx, ry, rz = r_iH
+                vx, vy, vz = v_off
+                rho_h_sq = rx * rx + ry * ry
+                rho_h = float(np.sqrt(max(rho_h_sq, 1e-6)))
+                d_az = float((rx * vy - ry * vx) / max(rho_h_sq, 1e-6))
+                d_el = float((vz * rho_h_sq - rz * (rx * vx + ry * vy))
+                             / (max(rho_iH * rho_iH, 1e-6) * rho_h))
+                # 机头朝向与 LOS 单位向量的对准 cos —— 纯方向, 不含距离
+                v_norm = float(np.linalg.norm(v_off))
+                if v_norm > 1e-3:
+                    align_cos = float(np.dot(v_off, r_iH) / (v_norm * rho_safe))
+                else:
+                    align_cos = 0.0
             else:
-                dist_progress = 0.0  # dead/hit → distance irrelevant
-
-            # V35新增: teammates_drawing_fire — 正在吸引拦截器的队友数量
-            n_mates_drawing_fire = 0
-            for k, other in enumerate(self.offensives):
-                if k == ai or not other.alive or other.hit_hvt:
-                    continue
-                if other.locked_by_count > 0:
-                    n_mates_drawing_fire += 1
+                vc_iH = 0.0
+                d_az = 0.0
+                d_el = 0.0
+                align_cos = 0.0
 
             obs.extend([
-                np.clip(rho_hvt / obs_range, 0.0, 2.0),      # 到HVT距离
-                np.clip(closing_hvt / vel_range, -1.0, 1.0),  # 闭合速度
-                np.clip(omega_hvt / 0.5, -1.0, 1.0),          # LOS角速度
-                np.clip(omega_dot_hvt / 0.8, -1.0, 1.0),      # LOS角加速度
-                np.clip(pn_hint_hvt / 30.0, -1.0, 1.0),       # PN制导提示
-                heading_error / np.pi,                          # V35: 航向偏差 [-1,1]
-                np.clip(dist_progress, 0.0, 2.0),              # V35: 距离进度
-                n_mates_drawing_fire / max(self.n_offensive - 1, 1),  # V35: 队友吸引火力
+                np.clip(d_az / omega_norm, -1.0, 1.0),
+                np.clip(d_el / omega_norm, -1.0, 1.0),
+                np.clip(vc_iH / vel_range, -1.0, 1.0),
+                np.clip(align_cos, -1.0, 1.0),
             ])
 
             # ============================================
-            # 3. Top-2 Threat Interceptors (6*2=12) — V35精简
+            # 3. Top-K threats (5*K=10) — 全部为 tex 中的理论核心量
             # ============================================
             threat_scores = self._compute_threat_scores(ai, agent)
             threat_scores.sort(key=lambda x: -x[0])
@@ -1001,37 +983,40 @@ class FOVPenetrationEnv:
                     _, di = threat_scores[k]
                     d = self.defensives[di]
                     if d.alive and agent.alive:
-                        rho_ij = agent.distance_3d(d)
                         v_off = self._vel3d(agent)
                         v_def = self._vel3d(d)
                         r_ij = np.array([agent.x - d.x, agent.y - d.y, agent.z - d.z])
+                        rho_ij = float(np.linalg.norm(r_ij))
                         rho_safe = max(rho_ij, 1e-3)
-                        vc_ij = float(-np.dot(r_ij, v_off - v_def) / rho_safe)
-
+                        v_rel = v_off - v_def
+                        # 闭合速度 V_c_ij = -d(ρ)/dt = -(r·v_rel)/ρ
+                        vc_ij = float(-np.dot(r_ij, v_rel) / rho_safe)
+                        # FOV 锥裕度 q_ij (tex 公式)
                         cg = np.cos(d.gamma)
                         b_j = np.array([cg * np.cos(d.heading),
                                         cg * np.sin(d.heading),
                                         np.sin(d.gamma)])
                         cos_theta = np.clip(np.dot(b_j, r_ij) / rho_safe, -1.0, 1.0)
-                        theta_ij = np.arccos(cos_theta)
-                        bearing_error = theta_ij - fov_half
                         q_ij = cos_theta - np.cos(fov_half)
-                        in_fov = 1.0 if q_ij > 0 else 0.0
-
+                        # 视线角速度模长 (tex 公式)
+                        omega_los_ij = float(np.linalg.norm(np.cross(r_ij, v_rel))
+                                             / max(rho_safe * rho_safe, 1e-6))
+                        # 跟踪失配裕度 Γ_ij = |ω| - a_max/V_j (tex 公式)
+                        # 归一化为 (|ω| * V_j / a_max - 1) ∈ [-1, +∞), 取 tanh 限幅
+                        v_def_safe = max(d.v, 1.0)
+                        gamma_ratio = omega_los_ij * v_def_safe / max(a_def_max, 1.0) - 1.0
+                        Gamma_norm = float(np.tanh(gamma_ratio))
+                        # 是否锁定我
                         policy = self.defensive_policies[di]
                         is_locking = 1.0 if (policy.lock_mode == InterceptorPolicy.STATE_LOCKED
                                              and policy.current_locked_target_idx == ai) else 0.0
 
-                        cross = np.cross(r_ij, v_off - v_def)
-                        omega_los_ij = float(np.linalg.norm(cross) / max(rho_safe ** 2, 1e-6))
-
                         obs.extend([
-                            np.clip(rho_ij / obs_range, 0.0, 2.0),
+                            np.clip(q_ij, -1.0, 1.0),
                             np.clip(vc_ij / vel_range, -1.0, 1.0),
-                            np.clip(bearing_error / np.pi, -1.0, 1.0),
-                            in_fov,
+                            np.clip(omega_los_ij / omega_norm, 0.0, 2.0),
+                            Gamma_norm,
                             is_locking,
-                            np.clip(omega_los_ij / 0.5, 0.0, 2.0),
                         ])
                     else:
                         obs.extend([0.0] * self._dim_per_threat)
@@ -1039,41 +1024,26 @@ class FOVPenetrationEnv:
                     obs.extend([0.0] * self._dim_per_threat)
 
             # ============================================
-            # 4. Team Situation (4) — V35精简
+            # 4. Team & priors (3) — 注意力转移信号 + 理论先验
             # ============================================
-            n_mates_locked = 0
-            n_mates_free = 0
-            n_alive = 0
+            n_mates_drawing_fire = 0
             for k, other in enumerate(self.offensives):
                 if k == ai or not other.alive or other.hit_hvt:
                     continue
-                n_alive += 1
                 if other.locked_by_count > 0:
-                    n_mates_locked += 1
-                else:
-                    n_mates_free += 1
+                    n_mates_drawing_fire += 1
 
-            team_pen_score = pen_info.get("N_eff", 0.0)
-
-            obs.extend([
-                n_mates_locked / max(self.n_offensive - 1, 1),
-                n_mates_free / max(self.n_offensive - 1, 1),
-                np.clip(team_pen_score / max(self.n_offensive, 1), 0.0, 1.0),
-                (n_alive + 1) / self.n_offensive,  # 包括自己的存活比
-            ])
-
-            # ============================================
-            # 5. Target Priority (2) — V35精简
-            # ============================================
             P_pen_i = pen_info.get("P_pen_per_agent", [0.0] * self.n_offensive)[ai]
             P_hit_i = pen_info.get("P_hit_per_agent", [0.0] * self.n_offensive)[ai]
+
             obs.extend([
+                n_mates_drawing_fire / max(self.n_offensive - 1, 1),
                 np.clip(P_pen_i, 0.0, 1.0),
                 np.clip(P_hit_i, 0.0, 1.0),
             ])
 
             # ============================================
-            # 6. Time (1)
+            # 5. Time (1)
             # ============================================
             obs.append(self.current_step / self.max_steps)
 

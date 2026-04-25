@@ -1,0 +1,793 @@
+% !TEX root = newswarm_main.tex
+\subsection{多拦截器锥约束下的聚合脱锥风险建模与终端安全突防机理}
+
+考虑进攻集群与拦截集群的对抗场景。设进攻集群个体集合为
+\[
+\mathcal{A}=\{1,\dots,N_A\},
+\]
+拦截集群个体集合为
+\[
+\mathcal{I}=\{1,\dots,N_I\}.
+\]
+对任意进攻飞行器 $i\in\mathcal{A}$，其状态与控制分别记为
+\[
+x_i(t)\in\mathbb{R}^{n_x},\qquad u_i(t)\in\mathbb{R}^{n_u},
+\]
+对任意拦截器 $j\in\mathcal{I}$，其状态与控制分别记为
+\[
+y_j(t)\in\mathbb{R}^{n_y},\qquad v_j(t)\in\mathbb{R}^{n_v}.
+\]
+固定高价值目标位置记为 $p_H\in\mathbb{R}^3$。本节关注的问题是：在敌方多拦截器锥形探测约束下，如何统一刻画单架进攻飞行器在未来终端时刻的脱锥风险，并进一步构造整个进攻集群的联合暴露风险指标，为后续主动诱饵决策与有效突防数量优化提供解析基础。
+
+对任意进攻飞行器 $i\in\mathcal{A}$ 和拦截器 $j\in\mathcal{I}$，记其相对位置为
+\begin{equation}
+r_{ij}=p_i-p_j,
+\end{equation}
+相对距离为
+\begin{equation}
+\rho_{ij}=\|r_{ij}\|.
+\end{equation}
+设拦截器雷达锥轴单位向量为 $b_j$，半锥角为 $\alpha_j$，则定义目标相对于视场锥边界的裕度函数
+\begin{equation}
+q_{ij}(t)
+=
+\frac{b_j^{\top}r_{ij}(t)}{\|r_{ij}(t)\|}-\cos\alpha_j.
+\end{equation}
+由定义可知：
+
+\begin{itemize}
+  \item 当 $q_{ij}(t)>0$ 时，进攻飞行器位于拦截器 $j$ 的高频探测锥内；
+  \item 当 $q_{ij}(t)=0$ 时，进攻飞行器位于锥边界；
+  \item 当 $q_{ij}(t)<0$ 时，进攻飞行器位于锥外。
+\end{itemize}
+
+因此，$q_{ij}(t)$ 可视为一个连续的锥约束边界函数，其不仅能够描述当前是否被探测，还能够刻画目标相对于探测边界的几何裕度。为了进一步研究“在当前状态下，若不施加额外控制，未来终端时刻是否仍可能处于敌方高频探测锥内”的问题，需要构造相应的零努力脱锥裕度（zero-effort cone-margin）。
+
+\subsubsection{锥边界附近的一阶飞控局部线性模型}
+
+为了沿用零努力变换与伴随系统的推导框架，本文在锥边界附近对攻防相对运动进行局部线性化。将 $q_{ij}(t)$ 视为沿锥边界法向的局部坐标，并记其时间导数为 $\dot q_{ij}(t)$。同时，引入拦截器和进攻飞行器在该局部法向方向上的等效加速度状态，分别记为 $a_{I,j}(t)$ 与 $a_{A,i}(t)$。于是构造局部状态向量
+\begin{equation}
+\xi_{ij}(t)=
+\begin{bmatrix}
+q_{ij}(t)\\
+\dot q_{ij}(t)\\
+a_{I,j}(t)\\
+a_{A,i}(t)
+\end{bmatrix}.
+\end{equation}
+
+考虑加速度响应存在一阶飞控滞后，分别采用如下动态模型：
+\begin{equation}
+\dot a_{I,j}(t)
+=
+-\frac{1}{\tau_{I,j}}a_{I,j}(t)
++
+\frac{1}{\tau_{I,j}}u_{I,j}(t),
+\end{equation}
+\begin{equation}
+\dot a_{A,i}(t)
+=
+-\frac{1}{\tau_{A,i}}a_{A,i}(t)
++
+\frac{1}{\tau_{A,i}}u_{A,i}(t),
+\end{equation}
+其中 $\tau_{I,j}$ 与 $\tau_{A,i}$ 分别为拦截器和进攻飞行器的一阶飞控时间常数，$u_{I,j}(t)$ 与 $u_{A,i}(t)$ 为对应的加速度指令。
+
+进一步地，本文假设拦截器在局部边界方向上采用近似的锥边界保持导引规律，其控制输入由当前边界裕度 $q_{ij}(t)$ 与变化率 $\dot q_{ij}(t)$ 决定，并随剩余时间
+\begin{equation}
+t_{go}=t_f-t
+\end{equation}
+变化。由局部小扰动假设可得
+\begin{equation}
+\ddot q_{ij}(t)=-a_{I,j}(t)+a_{A,i}(t).
+\end{equation}
+于是，局部线性时变状态方程可写为
+\begin{equation}
+\dot \xi_{ij}(t)
+=
+A_{c,ij}(t)\,\xi_{ij}(t)
++
+B_{A,i}\,u_{A,i}(t),
+\end{equation}
+其中
+\begin{equation}
+A_{c,ij}(t)
+=
+\begin{bmatrix}
+0 & 1 & 0 & 0\\
+0 & 0 & -1 & 1\\
+\dfrac{N_{c,j}}{\tau_{I,j} t_{go}^{2}}
+&
+\dfrac{N_{c,j}}{\tau_{I,j} t_{go}}
+&
+-\dfrac{1}{\tau_{I,j}}
+&
+0\\[1ex]
+0 & 0 & 0 & -\dfrac{1}{\tau_{A,i}}
+\end{bmatrix},
+\end{equation}
+\begin{equation}
+B_{A,i}
+=
+\begin{bmatrix}
+0\\
+0\\
+0\\
+\dfrac{1}{\tau_{A,i}}
+\end{bmatrix}.
+\end{equation}
+这里，$N_{c,j}$ 表示拦截器在局部锥边界保持问题下的等效导引增益。上述模型的物理含义是：$q_{ij}(t)$ 和 $\dot q_{ij}(t)$ 描述了进攻飞行器相对于拦截器锥边界的局部位置与运动趋势，而 $a_{I,j}(t)$ 和 $a_{A,i}(t)$ 则刻画了敌我双方在该局部法向方向上的等效机动能力。
+
+\subsubsection{零努力脱锥裕度与伴随系统}
+
+在当前时刻 $t$，若未来区间 $[t,t_f]$ 内不再施加额外控制，即令 $u_{A,i}(\tau)\equiv 0$，则终端时刻 $t_f$ 的锥边界裕度可由当前状态唯一决定。为刻画这种“零努力条件下的终端脱锥结果”，定义输出向量
+\begin{equation}
+c=
+\begin{bmatrix}
+1\\
+0\\
+0\\
+0
+\end{bmatrix},
+\end{equation}
+则终端锥边界裕度可表示为
+\begin{equation}
+q_{ij}(t_f)=c^{\top}\xi_{ij}(t_f).
+\end{equation}
+
+记局部系统在 $u_{A,i}\equiv 0$ 条件下的状态转移矩阵为 $\Phi_{ij}(t_f,t)$，则有
+\begin{equation}
+\xi_{ij}(t_f)=\Phi_{ij}(t_f,t)\,\xi_{ij}(t).
+\end{equation}
+因此，
+\begin{equation}
+q_{ij}(t_f)=c^{\top}\Phi_{ij}(t_f,t)\,\xi_{ij}(t).
+\end{equation}
+为将终端输出写成当前状态的显式线性函数，定义伴随变量
+\begin{equation}
+Y_{ij}(t_{go})=\Phi_{ij}^{\top}(t_f,t)\,c,
+\end{equation}
+于是零努力脱锥裕度可写为
+\begin{equation}
+Z_{ij}(t)=Y_{ij}^{\top}(t_{go})\,\xi_{ij}(t).
+\end{equation}
+这里，$Z_{ij}(t)$ 的物理含义为：在当前时刻停止施加新的控制输入时，进攻飞行器 $i$ 在终端时刻相对于拦截器 $j$ 探测锥边界的预测裕度。
+
+将
+\begin{equation}
+Y_{ij}(t)=
+\begin{bmatrix}
+Y_{1,ij}(t)\\
+Y_{2,ij}(t)\\
+Y_{3,ij}(t)\\
+Y_{4,ij}(t)
+\end{bmatrix}
+\end{equation}
+代入，并利用伴随系统
+\begin{equation}
+\dot Y_{ij}(t)=A_{c,ij}^{\top}(t_f-t)\,Y_{ij}(t),
+\qquad
+Y_{ij}(0)=c,
+\end{equation}
+可得初值条件
+\begin{equation}
+Y_{1,ij}(0)=1,\qquad
+Y_{2,ij}(0)=0,\qquad
+Y_{3,ij}(0)=0,\qquad
+Y_{4,ij}(0)=0.
+\end{equation}
+进一步可推出
+\begin{equation}
+Y_{2,ij}(t)=t\,Y_{1,ij}(t),
+\end{equation}
+并将伴随系统化简为
+\begin{equation}
+\dot Y_{1,ij}(t)
+=
+\frac{N_{c,j}}{\tau_{I,j}t^{2}}Y_{3,ij}(t),
+\qquad
+Y_{1,ij}(0)=1,
+\end{equation}
+\begin{equation}
+\dot Y_{3,ij}(t)
+=
+-t\,Y_{1,ij}(t)-\frac{1}{\tau_{I,j}}Y_{3,ij}(t),
+\qquad
+Y_{3,ij}(0)=0,
+\end{equation}
+\begin{equation}
+\dot Y_{4,ij}(t)
+=
+t\,Y_{1,ij}(t)-\frac{1}{\tau_{A,i}}Y_{4,ij}(t),
+\qquad
+Y_{4,ij}(0)=0.
+\end{equation}
+于是，零努力脱锥裕度可显式写为
+\begin{equation}
+Z_{ij}(t)
+=
+Y_{1,ij}(t_{go})
+\bigl(
+q_{ij}(t)+t_{go}\dot q_{ij}(t)
+\bigr)
++
+Y_{3,ij}(t_{go})a_{I,j}(t)
++
+Y_{4,ij}(t_{go})a_{A,i}(t).
+\end{equation}
+
+该式表明，终端脱锥裕度由三部分共同决定：第一项反映当前位置及其变化趋势对终端结果的贡献；第二项反映拦截器当前机动状态对未来脱锥结果的抑制作用；第三项反映进攻飞行器当前机动状态对未来脱锥结果的促进作用。因此，$Z_{ij}(t)$ 不再是单纯的几何量，而是综合考虑了局部相对位置、相对运动趋势以及敌我双方一阶飞控动态之后的终端风险预测量。
+
+\subsubsection{多拦截器锥约束下的聚合脱锥风险}
+
+对于单个进攻飞行器 $i$ 而言，其真实安全性并非由某一个拦截器单独决定，而是由所有拦截器联合形成的探测约束共同决定。若直接采用
+\begin{equation}
+\max_{j\in\mathcal{I}} Z_{ij}(t)
+\end{equation}
+来刻画“最危险拦截器”的终端脱锥风险，虽然具有明确物理意义，但该表达不够平滑，不利于后续优化和强化学习训练。为此，本文采用 smooth-max 形式构造多拦截器聚合脱锥风险：
+\begin{equation}
+\widetilde Z_i(t)
+=
+\frac{1}{\beta_Z}
+\log\left(
+\sum_{j\in\mathcal{I}}
+\exp\!\bigl(\beta_Z Z_{ij}(t)\bigr)
+\right),
+\end{equation}
+其中 $\beta_Z>0$ 为平滑参数。当 $\beta_Z\to\infty$ 时，$\widetilde Z_i(t)$ 逼近 $\max_{j\in\mathcal{I}} Z_{ij}(t)$。因此，$\widetilde Z_i(t)$ 可理解为进攻飞行器 $i$ 在多拦截器联合锥约束下的总体终端脱锥风险。
+
+进一步地，引入单机风险死区函数
+\begin{equation}
+\Psi_i^{\mathrm{cone}}(t)
+=
+[\widetilde Z_i(t)+M_c]_+,
+\end{equation}
+其中 $M_c>0$ 为终端安全脱锥裕度。当 $\widetilde Z_i(t)\le -M_c$ 时，表明飞行器 $i$ 对所有拦截器均已具备足够的终端脱锥裕度，此时风险项为零；反之，$\Psi_i^{\mathrm{cone}}(t)>0$，且随终端脱锥裕度不足程度增大而增大。
+
+于是，可构造整个进攻集群在时刻 $t$ 的聚合锥风险 cost：
+\begin{equation}
+c_t^{\mathrm{cone}}
+=
+\sum_{i\in\mathcal{A}}
+\Psi_i^{\mathrm{cone}}(t)
+=
+\sum_{i\in\mathcal{A}}
+[\widetilde Z_i(t)+M_c]_+.
+\end{equation}
+该 cost 统一刻画了多拦截器联合探测约束下进攻集群的未来终端暴露风险，是后续强化学习中安全约束设计的核心解析量之一。
+
+\subsubsection{聚合脱锥风险在强化学习中的嵌入方式}
+
+由于 $Z_{ij}(t)$、$\widetilde Z_i(t)$ 与 $c_t^{\mathrm{cone}}$ 直接反映了终端安全脱锥趋势，因此它们可自然嵌入强化学习框架中。一方面，可将 $\widetilde Z_i(t)$ 或 $\Psi_i^{\mathrm{cone}}(t)$ 作为辅助观测量输入策略网络，用以增强智能体对未来终端暴露风险的感知。另一方面，在约束强化学习框架中，可将聚合锥风险 cost 写成
+\begin{equation}
+c_t
+=
+\kappa_1 c_t^{\mathrm{cone}}
++
+\kappa_2 c_t^{\mathrm{danger}}
++
+\kappa_3 c_t^{\mathrm{collision}}
++
+\kappa_4 c_t^{\mathrm{boundary}},
+\end{equation}
+其中 $c_t^{\mathrm{danger}}$、$c_t^{\mathrm{collision}}$ 和 $c_t^{\mathrm{boundary}}$ 分别表示危险近距区、碰撞和越界代价，$\kappa_1,\kappa_2,\kappa_3,\kappa_4>0$ 为权重。
+
+此外，若希望显式鼓励智能体朝着降低未来终端暴露风险的方向行动，还可进一步构造风险改善奖励
+\begin{equation}
+r_t^{\mathrm{cone\_imp}}
+=
+\lambda_Z
+\sum_{i\in\mathcal{A}}
+\left(
+[\widetilde Z_i(t)+M_c]_+
+-
+[\widetilde Z_i(t+\Delta t)+M_c]_+
+\right),
+\end{equation}
+其中 $\lambda_Z>0$。该项在智能体能够降低未来聚合锥风险时取正值，从而为后续主动诱饵决策和有效突防数量优化提供底层的几何安全支撑。
+
+综上，本节从单拦截器零努力脱锥裕度出发，构建了多拦截器联合锥约束下的聚合脱锥风险模型。该模型既是后续主动诱饵博弈中个体暴露代价与群体突破收益计算的重要基础，也是第三研究内容中突防成功度与有效突防数量建模的关键解析先验。
+
+
+
+\subsection{基于“先入视场即锁定”规则的主动诱饵突防博弈机理与群体决策方法}
+
+考虑进攻集群与拦截集群的对抗场景。设进攻集群个体集合为
+\[
+\mathcal{A}=\{1,\dots,N_A\},
+\]
+拦截集群个体集合为
+\[
+\mathcal{I}=\{1,\dots,N_I\}.
+\]
+对任意进攻飞行器 $i\in\mathcal{A}$，其状态与控制分别记为
+\[
+x_i(t)\in\mathbb{R}^{n_x},\qquad u_i(t)\in\mathbb{R}^{n_u},
+\]
+对任意拦截器 $j\in\mathcal{I}$，其状态与控制分别记为
+\[
+y_j(t)\in\mathbb{R}^{n_y},\qquad v_j(t)\in\mathbb{R}^{n_v}.
+\]
+系统动力学可统一写为
+\begin{equation}
+\dot x_i=f_A(x_i,u_i),\qquad i\in\mathcal{A},
+\end{equation}
+\begin{equation}
+\dot y_j=f_I(y_j,v_j),\qquad j\in\mathcal{I}.
+\end{equation}
+
+本文考虑如下拦截规则：拦截器在初始阶段依据目指信息完成目标分配并按指定方向飞行；一旦某进攻飞行器率先进入其探测视场，该拦截器立即放弃原有分配，转而锁定并攻击该先入视场目标。为描述该机制，首先定义进攻飞行器 $i$ 与拦截器 $j$ 的相对位置
+\begin{equation}
+r_{ij}=p_i-p_j,
+\end{equation}
+其中 $p_i$ 和 $p_j$ 分别表示进攻飞行器和拦截器的位置。设拦截器雷达锥轴单位向量为 $b_j$，半锥角为 $\alpha_j$，则目标相对于视场锥边界的裕度函数定义为
+\begin{equation}
+q_{ij}
+=
+\frac{b_j^{\top}r_{ij}}{\|r_{ij}\|}-\cos\alpha_j.
+\end{equation}
+其中，$q_{ij}>0$ 表示目标位于视场锥内，$q_{ij}=0$ 表示目标位于边界，$q_{ij}<0$ 表示目标位于锥外。为了获得可导的连续表达，定义平滑视场占用函数
+\begin{equation}
+s_{ij}(t)=\sigma\!\bigl(\kappa_q q_{ij}(t)\bigr),
+\end{equation}
+其中 $\sigma(\cdot)$ 为 sigmoid 函数，$\kappa_q>0$ 为平滑参数。由此，$s_{ij}(t)$ 可刻画目标进入视场的连续程度。
+
+为近似描述“先入视场即锁定”的事件触发规则，引入拦截器 $j$ 对进攻飞行器 $i$ 的锁定吸引强度
+\begin{equation}
+\eta_{ij}(t)
+=
+w_s s_{ij}(t)
+-
+w_{\rho}\rho_{ij}(t)
++
+w_v V_{c,ij}(t),
+\end{equation}
+其中
+\[
+\rho_{ij}(t)=\|r_{ij}(t)\|
+\]
+表示相对距离，$V_{c,ij}(t)$ 表示闭合速度，$w_s,w_{\rho},w_v>0$ 为权重系数。基于此定义拦截器 $j$ 对目标 $i$ 的软锁定概率
+\begin{equation}
+p_{ij}^{\mathrm{lock}}(t)
+=
+\frac{\exp\!\bigl(\beta_L \eta_{ij}(t)\bigr)}
+{\sum\limits_{k\in\mathcal{A}}\exp\!\bigl(\beta_L \eta_{kj}(t)\bigr)},
+\end{equation}
+其中 $\beta_L>0$ 为温度参数。$\beta_L$ 越大，该表达越接近硬触发锁定规则。
+
+在此基础上，构造主动诱饵行为的局部代价与群体收益。首先定义个体 $i$ 的自身诱饵代价为
+\begin{equation}
+C_i^{\mathrm{self}}(t)
+=
+\sum_{j\in\mathcal{I}}
+p_{ij}^{\mathrm{lock}}(t)
+\left(
+\lambda_E E_{ij}(t)
++
+\lambda_D D_{ij}(t)
++
+\lambda_K K_{ij}(t)
+\right),
+\end{equation}
+其中 $E_{ij}(t)$ 表示锥内暴露强度，$D_{ij}(t)$ 表示危险近距接触代价，$K_{ij}(t)$ 表示被击落风险，$\lambda_E,\lambda_D,\lambda_K>0$ 为权重。
+
+其次，为描述个体 $i$ 主动暴露后对其他成员所带来的注意力转移收益，定义
+\begin{equation}
+B_i^{\mathrm{attn}}(t)
+=
+\sum_{j\in\mathcal{I}}
+\sum_{\substack{k\in\mathcal{A}\\k\neq i}}
+p_{ij}^{\mathrm{lock}}(t)\,\Theta_{kj}(t),
+\end{equation}
+其中 $\Theta_{kj}(t)$ 表示拦截器 $j$ 对进攻飞行器 $k$ 的威胁强度。可取
+\begin{equation}
+\Theta_{kj}(t)
+=
+\lambda_Z\,[\widetilde{Z}_{kj}(t)+M_c]_+
++
+\lambda_R \sigma\!\bigl(\kappa_d(d_s-\rho_{kj}(t))\bigr),
+\end{equation}
+其中 $\widetilde{Z}_{kj}(t)$ 为相对局部脱锥风险，$M_c$ 为脱锥安全裕度，$d_s$ 为危险距离阈值，$\lambda_Z,\lambda_R,\kappa_d>0$ 为参数。
+
+进一步地，为表征主动诱饵行为对群体最终突防打击的收益，定义
+\begin{equation}
+B_i^{H}(t)
+=
+\sum_{\substack{k\in\mathcal{A}\\k\neq i}}
+\lambda_H P_k^{\mathrm{pen}}(t)\,P_k^{\mathrm{hit}}(t),
+\end{equation}
+其中 $P_k^{\mathrm{pen}}(t)\in[0,1]$ 表示第 $k$ 架飞行器的突防成功度，$P_k^{\mathrm{hit}}(t)\in[0,1]$ 表示其对高价值目标的打击可行度，$\lambda_H>0$ 为权重。
+
+综上，定义进攻飞行器 $i$ 在当前时刻承担诱饵角色的局部价值函数为
+\begin{equation}
+U_i^{D}(t)
+=
+B_i^{\mathrm{attn}}(t)
++
+B_i^{H}(t)
+-
+C_i^{\mathrm{self}}(t).
+\end{equation}
+当 $U_i^{D}(t)>0$ 时，表明个体 $i$ 在当前时刻主动暴露并诱导拦截器锁定，在群体层面是有利的；当 $U_i^{D}(t)<0$ 时，表明该行为在当前态势下不值得采取。
+
+由于本文不预先固定“诱饵机”和“主攻机”身份，因此进一步引入角色混合策略。对每个进攻飞行器 $i$，定义其角色概率向量
+\begin{equation}
+\pi_i(t)=
+\bigl(
+\pi_i^{D}(t),\,
+\pi_i^{P}(t),\,
+\pi_i^{S}(t)
+\bigr),
+\end{equation}
+其中 $\pi_i^{D}$、$\pi_i^{P}$、$\pi_i^{S}$ 分别表示个体在当前时刻承担主动诱饵、主攻突破和隐蔽规避角色的概率，并满足
+\begin{equation}
+\pi_i^{D}(t)+\pi_i^{P}(t)+\pi_i^{S}(t)=1,\qquad
+\pi_i^{r}(t)\ge 0,\quad r\in\{D,P,S\}.
+\end{equation}
+分别定义三种角色的局部效用为 $U_i^{D}(t)$、$U_i^{P}(t)$ 和 $U_i^{S}(t)$，则采用 logit 最优响应可得
+\begin{equation}
+\pi_i^{r}(t)
+=
+\frac{\exp\!\bigl(\eta U_i^{r}(t)\bigr)}
+{\sum\limits_{s\in\{D,P,S\}}\exp\!\bigl(\eta U_i^{s}(t)\bigr)},
+\qquad r\in\{D,P,S\},
+\end{equation}
+其中 $\eta>0$ 为理性系数。该表达表明，角色选择不是预设的，而是由当前局部效用驱动的在线自适应结果。
+
+为了将该主动诱饵机制提升为群体博弈层面的统一刻画，定义总势函数
+\begin{equation}
+\Phi_{\mathrm{decoy}}(t)
+=
+\sum_{i\in\mathcal{A}}
+\Bigl(
+\pi_i^{D}(t)U_i^{D}(t)
++
+\pi_i^{P}(t)U_i^{P}(t)
++
+\pi_i^{S}(t)U_i^{S}(t)
+\Bigr)
+-
+\frac{\tau_{\pi}}{\eta}
+\sum_{i\in\mathcal{A}}
+\sum_{r\in\{D,P,S\}}
+\pi_i^{r}(t)\ln \pi_i^{r}(t),
+\end{equation}
+其中最后一项为熵正则项，$\tau_{\pi}>0$ 为权重。于是，主动诱饵突防问题可刻画为如下熵正则势博弈：
+\begin{equation}
+\pi^{\star}(t)
+=
+\arg\max_{\{\pi_i\}_{i\in\mathcal{A}}}
+\Phi_{\mathrm{decoy}}(t).
+\end{equation}
+由此得到的并不是固定的诱饵分配方案，而是一个由局部代价、群体收益和注意力重定向共同决定的群体决策机制。
+
+为了嵌入强化学习框架，可将上述理论结果转化为结构化先验。例如，可将诱饵价值函数 $U_i^{D}(t)$、角色概率 $\pi_i^{D}(t),\pi_i^{P}(t),\pi_i^{S}(t)$ 作为观测辅助量引入策略网络；同时，可进一步构造势函数增量奖励
+\begin{equation}
+r_t^{\mathrm{decoy}}
+=
+\lambda_{\Phi}
+\bigl(
+\Phi_{\mathrm{decoy}}(t+\Delta t)-\Phi_{\mathrm{decoy}}(t)
+\bigr),
+\end{equation}
+其中 $\lambda_{\Phi}>0$。这样便可将“主动诱饵式突防”的群体博弈机制嵌入到后续强化学习训练中，用以引导集群形成在线自适应的角色涌现与协同决策行为。
+
+\subsection{面向有效突防数量最大化的局部逃逸机理与群体价值优化方法}
+
+在主动诱饵机制作用下，敌方拦截注意力与拦截资源会发生局部重定向，从而为后续进攻成员创造阶段性低探测、低拦截概率的突防窗口。然而，局部窗口的出现并不必然转化为群体有效突防数量的提升。若后续成员缺乏对窗口的及时利用能力，则可能出现诱饵成员被消耗而主攻成员未能完成突破、局部机会被浪费以及本可保全成员被无效消耗等问题。因此，本节进一步研究在局部突破窗口形成后，单机如何通过近距机动摆脱关键拦截器，以及群体如何在局部牺牲与整体突破收益之间建立最优权衡，从而实现有效突防数量最大化。
+
+\subsubsection{近距 LOS 角速度突增引发跟踪失配的局部逃逸机理}
+
+考虑进攻飞行器 $i$ 与拦截器 $j$ 的局部交战关系。记相对位置与相对速度分别为
+\begin{equation}
+r_{ij}=p_i-p_j,\qquad v_{ij}=v_i-v_j,
+\end{equation}
+相对距离为
+\begin{equation}
+\rho_{ij}=\|r_{ij}\|.
+\end{equation}
+则相对视线（line-of-sight, LOS）角速度向量定义为
+\begin{equation}
+\omega_{ij}^{\mathrm{LOS}}
+=
+\frac{r_{ij}\times v_{ij}}{\|r_{ij}\|^2},
+\end{equation}
+其模长可写为
+\begin{equation}
+\|\omega_{ij}^{\mathrm{LOS}}\|
+=
+\frac{\|r_{ij}\times v_{ij}\|}{\rho_{ij}^2}
+=
+\frac{\|v_{t,ij}\|}{\rho_{ij}},
+\end{equation}
+其中 $v_{t,ij}$ 表示相对速度在 LOS 切向平面内的分量。由上式可见，LOS 角速度不仅与切向相对速度有关，还受到相对距离 $\rho_{ij}$ 的显著放大效应，因此近距离条件下的小幅切向速度变化也可能引发较大的视线角速度变化。
+
+设进攻飞行器在短时间 $\Delta t$ 内施加一段沿 LOS 切向有利方向的机动，其等效切向加速度记为 $a_{t,ij}^{\mathrm{cmd}}$，则机动后的 LOS 角速度可近似表示为
+\begin{equation}
+\|\omega_{ij}^{\mathrm{LOS},+}(t)\|
+\approx
+\frac{\|v_{t,ij}(t)+a_{t,ij}^{\mathrm{cmd}}(t)\Delta t\|}{\rho_{ij}(t)}.
+\end{equation}
+拦截器能够维持稳定跟踪的前提是其可实现的最大跟踪角速度不低于当前 LOS 角速度。设拦截器最大法向过载能力为 $a_{j,\max}^{\perp}$，速度为 $V_j$，探测/伺服系统最大角速度带宽为 $\omega_{j,\max}^{\mathrm{sens}}$，则其最大可跟踪 LOS 角速度定义为
+\begin{equation}
+\omega_{j,\max}^{\mathrm{trk}}
+=
+\min\left(
+\frac{a_{j,\max}^{\perp}}{V_j},\,
+\omega_{j,\max}^{\mathrm{sens}}
+\right).
+\end{equation}
+当不考虑探测器伺服带宽限制时，可近似取
+\begin{equation}
+\omega_{j,\max}^{\mathrm{trk}}
+\approx
+\frac{a_{j,\max}^{\perp}}{V_j}.
+\end{equation}
+
+基于上述定义，构造局部跟踪失配裕度
+\begin{equation}
+\Gamma_{ij}(t)
+=
+\|\omega_{ij}^{\mathrm{LOS},+}(t)\|
+-
+\omega_{j,\max}^{\mathrm{trk}}(t).
+\end{equation}
+其中：
+
+\begin{itemize}
+  \item $\Gamma_{ij}(t)>0$ 表示若在当前时刻触发突然机动，则 LOS 角速度将超过拦截器的最大可跟踪能力，局部跟踪失配有望发生；
+  \item $\Gamma_{ij}(t)\le 0$ 表示即便实施当前机动，拦截器仍具备继续稳定跟踪的能力。
+\end{itemize}
+
+由于该机理仅在近距离交战条件下具有显著作用，进一步引入近距门控函数
+\begin{equation}
+G_{ij}^{\mathrm{near}}(t)
+=
+\sigma\!\bigl(\kappa_{\rho}(\rho_0-\rho_{ij}(t))\bigr),
+\end{equation}
+其中 $\rho_0$ 为近距触发半径，$\kappa_{\rho}>0$ 为平滑系数。于是，定义进攻飞行器 $i$ 相对于拦截器 $j$ 的近距逃逸触发量为
+\begin{equation}
+\Xi_{ij}(t)
+=
+G_{ij}^{\mathrm{near}}(t)\,[\Gamma_{ij}(t)]_+,
+\end{equation}
+其中 $[\cdot]_+$ 表示正部函数。该量同时刻画了两个条件：其一，当前交战是否已进入近距敏感区；其二，突发机动后 LOS 角速度是否足以触发敌方跟踪失配。只有当两者同时满足时，$\Xi_{ij}(t)$ 才显著增大。
+
+在多拦截器场景下，进攻飞行器的局部逃逸能力通常由其所面对的最危险拦截器决定。为此，定义进攻飞行器 $i$ 的局部逃逸能力指标为
+\begin{equation}
+E_i^{\mathrm{esc}}(t)
+=
+\max_{j\in\mathcal{I}} \Xi_{ij}(t).
+\end{equation}
+$E_i^{\mathrm{esc}}(t)$ 的物理含义是：在当前局势下，飞行器 $i$ 是否具备通过近距突发机动甩脱关键拦截器的能力。该量将作为后续有效突防数量建模中的重要局部机理量。
+
+\subsubsection{有效突防数量的群体价值建模}
+
+第三研究内容的核心目标并非简单提升单机生存率，而是在敌探测--拦截约束下，尽量减少无效牺牲，使更多进攻飞行器真正完成突破并保持对高价值目标的任务可达性。因此，需要构建一个同时考虑局部逃逸能力、整体突破成功度与群体终端收益的群体价值函数。
+
+对任意进攻飞行器 $i\in\mathcal{A}$，定义其有效突防贡献为
+\begin{equation}
+e_i(t)
+=
+P_i^{\mathrm{pen}}(t)\,P_i^{\mathrm{hit}}(t),
+\end{equation}
+其中 $P_i^{\mathrm{pen}}(t)\in[0,1]$ 表示第 $i$ 架飞行器的突防成功度，$P_i^{\mathrm{hit}}(t)\in[0,1]$ 表示其在当前状态下对高价值目标的打击可行度。
+
+首先，对突防成功度进行重新定义。与仅基于脱锥风险和威胁距离的刻画不同，本文将近距局部逃逸能力显式纳入突防成功度中。具体定义为
+\begin{equation}
+P_i^{\mathrm{pen}}(t)
+=
+\sigma\!\bigl(-\kappa_Z(\widetilde Z_i(t)+M_c)\bigr)
+\cdot
+\sigma\!\bigl(\kappa_d(\rho_i^{\mathrm{threat}}(t)-\rho_s)\bigr)
+\cdot
+\sigma\!\bigl(\kappa_m m_i^{\mathrm{local}}(t)\bigr)
+\cdot
+\sigma\!\bigl(\kappa_E E_i^{\mathrm{esc}}(t)\bigr),
+\end{equation}
+其中：
+
+\begin{itemize}
+  \item $\widetilde Z_i(t)$ 表示第 $i$ 架飞行器在多拦截器联合锥约束下的聚合脱锥风险；
+  \item $M_c$ 为安全脱锥裕度；
+  \item $\rho_i^{\mathrm{threat}}(t)=\min_{j\in\mathcal{I}}\rho_{ij}(t)$ 表示其距最危险拦截器的距离；
+  \item $\rho_s$ 为安全距离阈值；
+  \item $m_i^{\mathrm{local}}(t)$ 表示该飞行器局部威胁减弱或敌方注意力转移程度；
+  \item $E_i^{\mathrm{esc}}(t)$ 为近距局部逃逸能力指标；
+  \item $\kappa_Z,\kappa_d,\kappa_m,\kappa_E>0$ 为参数。
+\end{itemize}
+
+该定义表明，所谓“突防成功”不再仅由远距离脱锥风险降低所决定，还必须要求在局部近距交战中具备摆脱关键拦截器的能力。这样，近距 LOS 角速度突增引发跟踪失配的局部机制被正式纳入了群体层面的有效突防数量建模之中。
+
+其次，定义打击可行度。设高价值目标位置为 $p_H$，则进攻飞行器 $i$ 相对于目标的几何关系满足
+\[
+r_{iH}=p_H-p_i,\qquad
+\rho_{iH}=\|r_{iH}\|.
+\]
+记其对目标的闭合速度为 $V_{c,iH}(t)$，相对于目标的 LOS 角速度为 $\omega_{iH}^{\mathrm{LOS}}(t)$，则可定义
+\begin{equation}
+P_i^{\mathrm{hit}}(t)
+=
+\sigma\!\bigl(\kappa_h(R_H-\rho_{iH}(t))\bigr)
+\cdot
+\sigma\!\bigl(\kappa_c V_{c,iH}(t)\bigr)
+\cdot
+\sigma\!\bigl(-\kappa_{\omega}\|\omega_{iH}^{\mathrm{LOS}}(t)\|\bigr),
+\end{equation}
+其中 $R_H$ 为有效攻击半径，$\kappa_h,\kappa_c,\kappa_{\omega}>0$ 为参数。该项刻画飞行器是否已在几何上具备对高价值目标形成稳定打击的可能。
+
+由此可定义集群在时刻 $t$ 的有效突防数量（连续近似）为
+\begin{equation}
+N_{\mathrm{eff}}(t)
+=
+\sum_{i\in\mathcal{A}} e_i(t)
+=
+\sum_{i\in\mathcal{A}} P_i^{\mathrm{pen}}(t)\,P_i^{\mathrm{hit}}(t).
+\end{equation}
+在终端时刻 $T$，$N_{\mathrm{eff}}(T)$ 表示同时具备“成功突破”与“形成有效任务收益”能力的飞行器数量。
+
+为了区分必要损失与无效牺牲，进一步定义无效牺牲指标。记
+\begin{equation}
+\ell_i(T)\in\{0,1\}
+\end{equation}
+表示飞行器 $i$ 是否在终端前被摧毁。若某飞行器在被毁前本仍具备较强的脱锥成功趋势和局部逃逸能力，则应判定其损失为“本可避免的无效牺牲”。据此定义其可保全程度为
+\begin{equation}
+\chi_i^{\mathrm{salvage}}(T)
+=
+\sigma\!\bigl(-\kappa_Z(\widetilde Z_i(T)+M_c)\bigr)
+\cdot
+\sigma\!\bigl(\kappa_d(\rho_i^{\mathrm{threat}}(T)-\rho_s)\bigr)
+\cdot
+\sigma\!\bigl(\kappa_E E_i^{\mathrm{esc}}(T)\bigr),
+\end{equation}
+并定义无效牺牲量为
+\begin{equation}
+U_i^{\mathrm{waste}}(T)
+=
+\ell_i(T)\,\chi_i^{\mathrm{salvage}}(T).
+\end{equation}
+于是，总无效牺牲数量可写为
+\begin{equation}
+N_{\mathrm{waste}}(T)
+=
+\sum_{i\in\mathcal{A}} U_i^{\mathrm{waste}}(T).
+\end{equation}
+
+为了体现多架成功突防飞行器同时到达目标区域时所形成的非线性协同收益，引入饱和突防效能函数
+\begin{equation}
+J_{\mathrm{sat}}(T)
+=
+\lambda_1 N_{\mathrm{eff}}(T)
++
+\lambda_2 N_{\mathrm{eff}}^2(T),
+\end{equation}
+其中 $\lambda_1,\lambda_2>0$。其中第一项表示单架有效突防飞行器带来的线性收益，第二项表示有效突防成员数量增加所带来的群体协同增益。需要强调的是，此处所考虑的“饱和效能”并非脱离突防问题去讨论单纯末段打击，而是强调：只有当更多成员真正突破敌方防线后，后续任务收益才会呈现出明显的群体增强效应。
+
+记
+\begin{equation}
+N_{\mathrm{loss}}(T)=\sum_{i\in\mathcal{A}}\ell_i(T)
+\end{equation}
+为总损失数量，则终端总价值函数定义为
+\begin{equation}
+J_T
+=
+J_{\mathrm{sat}}(T)
+-
+\lambda_L N_{\mathrm{loss}}(T)
+-
+\lambda_U N_{\mathrm{waste}}(T),
+\end{equation}
+即
+\begin{equation}
+J_T
+=
+\lambda_1 N_{\mathrm{eff}}(T)
++
+\lambda_2 N_{\mathrm{eff}}^2(T)
+-
+\lambda_L N_{\mathrm{loss}}(T)
+-
+\lambda_U N_{\mathrm{waste}}(T),
+\end{equation}
+其中 $\lambda_L,\lambda_U>0$ 分别表示总损失和无效牺牲惩罚系数。该表达体现了第三研究内容的核心思想：少量成员的局部牺牲只有在能够换取更多成员真正完成突破时才具有正的群体价值，否则应被视为无效消耗。
+
+为将终端目标扩展到全过程，进一步构造运行阶段的群体社会效用泛函
+\begin{equation}
+\mathcal J
+=
+\mathbb E\left[
+\int_0^T
+\left(
+\lambda_P \sum_{i\in\mathcal{A}} P_i^{\mathrm{pen}}(t)
++
+\lambda_H \sum_{i\in\mathcal{A}} P_i^{\mathrm{hit}}(t)
+-
+\lambda_C \sum_{i\in\mathcal{A}} c_i^{\mathrm{cone}}(t)
+-
+\lambda_S \sum_{i\in\mathcal{A}} c_i^{\mathrm{self}}(t)
+\right)\,dt
++
+J_T
+\right],
+\end{equation}
+其中 $c_i^{\mathrm{cone}}(t)$ 表示锥内暴露代价，$c_i^{\mathrm{self}}(t)$ 表示局部危险/牺牲代价，$\lambda_P,\lambda_H,\lambda_C,\lambda_S>0$ 为权重。由此可见，第三研究内容并不是脱离突防主线去讨论末段打击，而是从群体价值角度统一刻画“局部逃逸能力--有效突防数量--终端任务收益”之间的内在联系。
+
+在大规模集群极限下，进一步定义进攻群体状态密度
+\begin{equation}
+\mu_A(x,t),
+\end{equation}
+以及终端进入有效任务区域 $\mathcal B_H$ 的群体质量
+\begin{equation}
+N_H(T)=\int_{\mathcal B_H}\mu_A(x,T)\,dx.
+\end{equation}
+则终端群体价值泛函可写为
+\begin{equation}
+\Phi_H(\mu_A(T))
+=
+\lambda_1 N_H(T)
++
+\lambda_2 N_H^2(T)
+-
+\lambda_U N_{\mathrm{waste}}(T).
+\end{equation}
+对应的均值场最优控制问题可由如下 HJB--FPK 耦合系统描述：
+\begin{equation}
+-\partial_t V(x,t)
+=
+\min_{u}
+\left[
+\ell(x,u,\mu_A,\mu_I)
++
+\nabla_x V(x,t)\cdot f_A(x,u)
+\right],
+\end{equation}
+\begin{equation}
+\partial_t \mu_A(x,t)
++
+\nabla_x\cdot\bigl(\mu_A(x,t)f_A(x,u^{\star}(x,t))\bigr)
+=
+-\lambda_{\mathrm{kill}}(x,\mu_A,\mu_I)\mu_A(x,t),
+\end{equation}
+其中终端条件取为
+\begin{equation}
+V(x,T)
+=
+\lambda_1 \mathbf{1}_{\mathcal B_H}(x)
++
+2\lambda_2 N_H(T)\mathbf{1}_{\mathcal B_H}(x)
+-
+\lambda_U \mathbf{1}_{\mathrm{waste}}(x).
+\end{equation}
+该终端条件表明：个体在终端进入有效任务区域的边际价值取决于当前已有多少同伴也成功进入该区域，这正是“更多成员成功突破”所带来的群体协同收益来源。
+
+最后，为了嵌入强化学习训练，可将上述理论结果转化为结构化先验。具体而言，可将
+\begin{equation}
+E_i^{\mathrm{esc}}(t),\qquad
+P_i^{\mathrm{pen}}(t),\qquad
+P_i^{\mathrm{hit}}(t),\qquad
+e_i(t)
+\end{equation}
+作为辅助观测输入策略网络；同时，将群体终端价值构造为终端奖励：
+\begin{equation}
+r_T
+=
+\lambda_1 N_{\mathrm{eff}}(T)
++
+\lambda_2 N_{\mathrm{eff}}^2(T)
+-
+\lambda_L N_{\mathrm{loss}}(T)
+-
+\lambda_U N_{\mathrm{waste}}(T),
+\end{equation}
+并在运行阶段加入辅助奖励
+\begin{equation}
+r_t^{\mathrm{pen}}
+=
+\lambda_P\sum_{i\in\mathcal{A}} P_i^{\mathrm{pen}}(t),
+\end{equation}
+\begin{equation}
+r_t^{\mathrm{esc}}
+=
+\lambda_E\sum_{i\in\mathcal{A}} E_i^{\mathrm{esc}}(t).
+\end{equation}
+由此，强化学习过程不再仅依赖稀疏的终端任务信号，而是在“局部逃逸能力--有效突防数量--群体终端收益”的统一理论引导下，学习如何将主动诱饵所创造的突破窗口真正转化为更多成员的成功突防结果。

@@ -229,6 +229,40 @@ def compute_rewards(offensives, defensives, hvt, config,
     reward_info["penalty_proximity"] = total_prox
 
     # ==========================================================
+    # V44 新增 A: 过冲惩罚 (overshoot_penalty)
+    # ==========================================================
+    # 当 d < overshoot_trigger 且闭合速度为负 (在远离HVT) 时，重罚
+    # 针对 trim 轨迹“掠过HVT后不回头”的问题 — 远比 closing<0 的一般远离要重
+    lambda_overshoot = rc.get("lambda_overshoot", 5.0)
+    overshoot_trigger = rc.get("overshoot_trigger_dist", 800.0)
+    total_overshoot = 0.0
+    for i, off in enumerate(offensives):
+        if off.alive and not off.hit_hvt and cur_dists[i] < overshoot_trigger:
+            if closing_speeds[i] < 0:
+                # 越近越重： (1 - d/trigger) 放大
+                near_factor = max(1.0 - cur_dists[i] / overshoot_trigger, 0.0)
+                pen = lambda_overshoot * (-closing_speeds[i]) / vel_range * (1.0 + 4.0 * near_factor)
+                rewards[i] -= pen
+                total_overshoot += pen
+    reward_info["penalty_overshoot"] = total_overshoot
+
+    # ==========================================================
+    # V44 新增 B: 稠密近靶指引 (proximity_dense_bonus)
+    # ==========================================================
+    # exp(-d/sigma) 越接近越大; sigma=200m 时: d=5m→0.975, 100m→0.61, 300m→0.22, 800m→0.018
+    # 这个信号在 trim 直飞下总量~0（d 一直>=200），只有末端机动收紧 d 才能拿到大头
+    # 相比 approach 增量，它是纯粵度信号，actor 必须主动向 d=0 优化
+    lambda_dense = rc.get("lambda_proximity_dense", 8.0)
+    sigma_dense = rc.get("proximity_dense_sigma", 200.0)
+    total_dense = 0.0
+    for i, off in enumerate(offensives):
+        if off.alive and not off.hit_hvt:
+            r_dense = lambda_dense * np.exp(-cur_dists[i] / sigma_dense)
+            rewards[i] += r_dense
+            total_dense += r_dense
+    reward_info["reward_proximity_dense"] = total_dense
+
+    # ==========================================================
     # 团队奖励: 队伍最小距离进度 (team_min_progress)
     # ==========================================================
     # 直接奖励“至少有人持续接近目标”，减少全队绕飞局部最优
@@ -305,7 +339,7 @@ def compute_rewards(offensives, defensives, hvt, config,
     # 命中 HVT — 巨额奖励, 全队共享
     # ==========================================================
     if hit_events:
-        hit_bonus = rc.get("hit_hvt_bonus", 8000.0) * len(hit_events)
+        hit_bonus = rc.get("hit_hvt_bonus", 6000.0) * len(hit_events)
         for i in range(n_off):
             rewards[i] += hit_bonus
         reward_info["hit_hvt"] = hit_bonus
@@ -357,16 +391,23 @@ def compute_terminal_rewards(offensives, hvt, config, ap_data=None):
     if min_dist == float('inf'):
         min_dist = 2000.0
 
+    # ==========================================================
     # 终端奖励
+    # V44 重塑: lambda_terminal_dist 从“线性衰减到 2000m=0”改为“指数衰减 exp(-min_d/sigma)”
+    #         默认 sigma=80m: min_d=5m→0.94, 50m→0.54, 200m→0.082, 500m→0.002
+    #         这样 actor 必须把 min_d 从 200m 推到 50m 才能拿到实质变化，逆逗末端机动
     lambda_hit = rc.get("lambda_terminal_hit", 800.0)
     lambda_dist = rc.get("lambda_terminal_dist", 500.0)
-    max_dist_ref = 2000.0
+    sigma_terminal = rc.get("terminal_dist_sigma", 80.0)
 
     # 命中奖励
     terminal_r = lambda_hit * N_hit
 
-    # 距离奖励: 越近越好 (即使没命中, 靠得近也给奖)
-    dist_reward = lambda_dist * max(1.0 - min_dist / max_dist_ref, 0.0)
+    # 距离奖励: V44 指数衰减—末端越近越陈险, 逆逗 actor 从 200m 供给到 5m
+    #            同时加一个“严重脱靶”线性项: min_d>500m 时线性扣分 (抖不出反馈)
+    dist_reward = lambda_dist * np.exp(-min_dist / sigma_terminal)
+    if min_dist > 500.0:
+        dist_reward -= lambda_dist * 0.5 * (min_dist - 500.0) / 1500.0
     terminal_r += dist_reward
 
     # 全军覆没额外惩罚

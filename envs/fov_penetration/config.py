@@ -111,14 +111,12 @@ DEFAULT_CONFIG = {
     "fov_half_angle": np.deg2rad(30.0),
     "detection_range": 2500.0,   # V23: 覆盖整个战场(map_size=2000, 对角~2800m)
 
-    # === V23: 对称命中机制 ===
-    # kill_range: FOV锁定击杀阈值，拦截器在此范围内持续锁定N步 → 双杀
-    # collision_kill_range: 纯碰撞击杀阈值（无条件双杀）
-    # 两者均为3m，与 hit_hvt_range 对称（攻守均为3m命中阈值）
-    "kill_range": 3.0,             # V23: 50→3m，拦截器FOV锁定击杀阈值（对称3m）
-    "collision_kill_range": 5.0,   # V23: 5m CPA双杀阈值（拦截器脱靶量<5m即命中）
-    "hit_hvt_range": 5.0,          # V23: 5m点目标命中（dt=0.01→步长0.5m）
-    "collision_range": 5.0,
+    # === V41: 统一 5m 命中机制 ===
+    # 拦截判定：拦截器与进攻方 CPA < 5m → 双杀（拦截成功）
+    # HVT 命中：进攻方与 HVT CPA < 5m → 命中目标
+    "collision_kill_range": 5.0,   # 拦截器脱靶量<5m即拦截成功(双杀)
+    "hit_hvt_range": 5.0,          # 进攻方脱靶量<5m即命中HVT (与拦截阈值对称)
+    "collision_range": 5.0,        # 兼容字段，等同 collision_kill_range
 
     # === V24: FOV逃逸机制已移除 — 纯碰撞击杀模式 ===
     # 拦截器逻辑: 初始分配目标 → PN制导 → 先入FOV的进攻方切换目标 → 碰撞双杀
@@ -164,69 +162,79 @@ DEFAULT_CONFIG = {
         "reassign_interval": 20,      # (保留字段但无效, reassign=False)
     },
 
-    # === V37 奖励: 修复 '飞歪' 问题 ===
-    # V36诊断: Agent mu偏置0.04→航向漂移1.6°/s→50s偏80°
-    #   根因: 1)heading奖只用cos(err),小角度梯度≈0 2)closing独大 3)无mu正则化
-    # V37修复: 1)加heading_error平方惩罚 2)加mu正则化 3)大幅增强heading信号 4)降低closing
+    # === V44 奖励: 反 trim 白嫖 (A) + 末端 exp(-d/σ) 稠密引导 + 过冲重罚 + 终端非线性距离 (B) ===
+    # 诊断结论 (V43): actor 输出≈trim 0, 直飞冲过 HVT, min_d 卡 200~300m, 0 命中
+    # 解法 (env 不动 / dt=0.01 / hit=5m 全部冻结):
+    #   1) lambda_approach 10→3, lambda_closing 0.4→0.15  (压 trim 直飞白拿大头)
+    #   2) 新增 proximity_dense_bonus = 8 * exp(-d/200): trim 路径 ~0, 末端进入 100m 才放量
+    #   3) 新增 overshoot_penalty: d<800m & closing<0 时按 (1+4*near) 倍重罚, 治飞过头
+    #   4) 终端 lambda_terminal_dist 500→1000, 改为 exp(-min_d/80) 末端反逼精度
+    #   5) lambda_proximity 0.15→0.05 (与 dense bonus 解耦)
     "reward": {
-        # --- 核心: 接近目标 ---
-        "lambda_approach": 30.0,           # 距离减少奖励 (delta_rho/norm * lambda)
-        "approach_norm_dist": 60.0,        # V36: 300→60 (dt=0.01步长0.45m, r_app=0.225/step)
-        "close_range_threshold": 800.0,    # V37: 500→800 (更早开始放大接近奖励)
-        "close_range_max_multiplier": 10.0, # 放大倍率
+        # --- 核心: 接近目标 (V44: 10→3, 进一步压 trim 白嫖) ---
+        "lambda_approach": 3.0,
+        "approach_norm_dist": 60.0,
+        "close_range_threshold": 800.0,
+        "close_range_max_multiplier": 10.0,
 
-        # --- 核心: 航向对准 (V37大幅增强) ---
-        "lambda_heading_align": 0.5,       # V37: 0.2→0.5 (cos加成更强)
-        "lambda_gamma_align": 0.3,         # V38: 俯仰对准HVT，避免高空平飞绕圈
-        # V37新增: 航向误差平方惩罚 (小角度强梯度, 比cos有效得多)
-        "lambda_heading_error_penalty": 0.8, # penalty = λ * (err/π)², 30°偏航→-0.022/step
+        # --- 核心: 航向对准 ---
+        "lambda_heading_align": 0.3,
+        "lambda_gamma_align": 0.2,
+        "lambda_heading_error_penalty": 0.2,
 
-        # --- 核心: 闭合速度 (V37削弱以停止主导) ---
-        "lambda_closing": 0.8,             # V37: 1.5→0.8 (不再是最强信号)
+        # --- 核心: 闭合速度 (V44: 0.4→0.15) ---
+        "lambda_closing": 0.15,
 
-        # --- V37新增: mu正则化 (防止无意义转弯) ---
-        "lambda_mu_regularize": 0.15,      # 惩罚|action[2]|, 鼓励直飞
-        "yaw_reg_relax_dist": 350.0,       # V38: 距HVT近时自动放松偏航正则
-        "yaw_reg_near_factor": 0.2,        # V38: 最近端只保留20%偏航正则
+        # --- mu正则化 ---
+        "lambda_mu_regularize": 0.05,
+        "yaw_reg_relax_dist": 350.0,
+        "yaw_reg_near_factor": 0.2,
 
-        # --- V38新增: 反回头与团队推进 ---
-        "lambda_no_retreat": 1.2,          # 惩罚负闭合速度(远离HVT)
-        "retreat_speed_ref": 35.0,         # 反回头归一化速度
-        "lambda_team_min_progress": 6.0,   # 奖励队伍最小距离持续下降
+        # --- 反回头与团队推进 ---
+        "lambda_no_retreat": 1.2,
+        "retreat_speed_ref": 35.0,
+        "lambda_team_min_progress": 4.0,
 
-        # --- 核心: 距离惩罚 (防止绕圈) ---
-        "lambda_proximity": 0.15,          # V37: 0.1→0.15 (略增, 配合heading强化)
-        "proximity_norm_dist": 1500.0,     # 归一化距离
+        # --- V44 新增 (A): 过冲重罚, 治"飞过 HVT 不回头" ---
+        "lambda_overshoot": 5.0,
+        "overshoot_trigger_dist": 800.0,
 
-        # --- 安全惩罚 (仅物理) ---
-        "lambda_penalty_boundary": 2.0,    # 越界
-        "lambda_penalty_ground": 1.0,      # 贴地
+        # --- V44 新增 (B): 末端 exp(-d/σ) 稠密引导, 远场≈0, 近场放量 ---
+        "lambda_proximity_dense": 8.0,
+        "proximity_dense_sigma": 200.0,
+
+        # --- 距离惩罚 (V44: 0.15→0.05, 与 dense bonus 解耦) ---
+        "lambda_proximity": 0.05,
+        "proximity_norm_dist": 1500.0,
+
+        # --- 安全惩罚 ---
+        "lambda_penalty_boundary": 2.0,
+        "lambda_penalty_ground": 1.0,
 
         # --- 被杀/命中 ---
-        "killed_penalty": -0.5,            # 被杀几乎不罚 → 鼓励勇敢突入
-        "hit_hvt_bonus": 6000.0,           # V38: 降低方差, 仍保持强命中驱动
-        "step_penalty": -0.003,            # 微弱步惩罚
+        "killed_penalty": -0.5,
+        "hit_hvt_bonus": 9000.0,
+        "step_penalty": -0.02,
 
-        # --- 终端奖励 (V35简化) ---
-        "lambda_terminal_hit": 800.0,      # 每命中一架的终端奖
-        "lambda_terminal_dist": 500.0,     # 距离终端奖 (越近越好)
+        # --- 终端奖励 (V44: lambda_terminal_dist 500→1000, 配合 exp(-min_d/80) 反逼末端精度) ---
+        "lambda_terminal_hit": 1500.0,
+        "lambda_terminal_dist": 1000.0,
+        "terminal_dist_sigma": 80.0,
 
-        # --- 超时惩罚 (env.step直接引用, 必须保留) ---
-        "timeout_penalty": -120.0,         # V38: 增加超时惩罚, 抑制保守拖时
-        "timeout_distance_penalty_coef": 1200.0, # V38: 加强超时距离惩罚
+        # --- 超时惩罚 ---
+        "timeout_penalty": -120.0,
+        "timeout_distance_penalty_coef": 1200.0,
 
-        # V37信号量级预估 (@1000m直飞, v=45m/s, heading_err=0):
-        #   approach: 30*0.45/60 = 0.225/step
-        #   heading_align: 0.5*cos(0) = 0.500/step
-        #   heading_err_pen: -0.8*(0/π)² = 0.000/step
-        #   closing: 0.8*45/120 = 0.300/step
-        #   mu_reg: -0.15*0 = 0.000/step
-        #   proximity: -0.15*1000/1500 = -0.100/step
-        #   NET: +0.925/step (直飞最优)
-        # @1000m, 30°偏航:
-        #   approach: 0.195, heading: 0.433, heading_pen: -0.022
-        #   closing: 0.260, mu_reg: -0.015, proximity: -0.100
-        #   NET: +0.751/step (-18.8% 相比直飞, V36仅-14%)
+        # V44 信号量级预估 (env 不动, dt=0.01s, hit=5m 全冻结):
+        #   trim 直飞 @1500m: approach=3*0.45/60=0.0225, closing=0.15*45/120=0.056,
+        #     dense=8*exp(-1500/200)=0.0044, proximity=-0.05*1=-0.05
+        #     NET ≈ +0.033/step (大幅压低相比 V43 的 +0.225)
+        #   末端 @100m, heading_err=0: dense=8*exp(-100/200)=4.85,
+        #     approach 进入 close_range 放大 ≈ 0.3, NET ≈ +5.0/step (放量 150x)
+        #   过冲 @300m, closing=-30: overshoot_pen=5*30/40*(1+4*0.625)=13.1/step (重创)
+        #   终端 min_d=50m: dist_reward = 1000*exp(-50/80)=535
+        #   终端 min_d=200m: dist_reward = 1000*exp(-200/80)=82
+        #   终端 min_d=5m: dist_reward = 1000*exp(-5/80)=940 (≈ 击中半个 hit_bonus)
     },
 
     # V28: cost 全部并入 reward, 保留字段但不再使用
@@ -273,11 +281,11 @@ DEFAULT_CONFIG = {
         "decoy_self_cost_weight": 1.0,   # 诱饵自身代价权重
         "decoy_attention_benefit_weight": 1.5,  # 注意力吸引收益权重
         "decoy_team_benefit_weight": 1.0,       # 队伍突防收益权重
-        "phi_decoy_weight": 0.05,        # Φ_decoy 势函数 reward 权重
+        "phi_decoy_weight": 0.0,         # V40: 暂时关闭 AP reward 子项, 仅用核心 reward 学习
         "expose_decoy_obs": True,         # 加入 observation
 
         # --- Module 3: LOS Escape Reward ---
-        "escape_reward_weight": 0.02,    # V19: 0.05→0.02, 进一步降低避免刷触发
+        "escape_reward_weight": 0.0,     # V40: 0.02 → 0 (暂时关闭)
         "rho_trigger": 150.0,           # near-distance trigger radius (m)
         "k_rho": 0.1,                   # sigmoid smoothness parameter
         "dt_trigger": None,             # override for dt (None = use env dt)
@@ -291,8 +299,8 @@ DEFAULT_CONFIG = {
         "kappa_h": 2.0,                  # P_i_hit miss_distance sigmoid
         "kappa_c": 1.0,                  # P_i_hit closing speed sigmoid
         "kappa_omega": 2.0,              # P_i_hit LOS rate sigmoid
-        "N_eff_reward_weight": 0.3,      # N_eff 增量 reward 权重
-        "N_waste_penalty_weight": 0.3,   # N_waste 惩罚权重
+        "N_eff_reward_weight": 0.0,      # V40: 0.3 → 0 (暂时关闭 AP reward)
+        "N_waste_penalty_weight": 0.0,   # V40: 0.3 → 0 (暂时关闭 AP reward)
         "terminal_group_value_weight": 1.0,  # 终端群体价值权重
         "synergy_exponent": 1.5,         # N_eff^α 协同指数
 
@@ -315,7 +323,7 @@ DEFAULT_CONFIG = {
 
         # --- Enhancement: Attack-gated HVT shaping reward ---
         "enable_attack_gate_reward": True,
-        "attack_gate_weight": 1.0,       # V22: 1.5→1.0, N_eff为主导, 降低attack gate
+        "attack_gate_weight": 0.0,       # V40: 1.0 → 0 (暂时关闭 AP reward)
         "attack_progress_weight": 1.0,
         "attack_closing_weight": 0.8,
         "attack_los_weight": 0.5,
@@ -338,7 +346,7 @@ DEFAULT_CONFIG = {
 
     # === 点目标命中配置 ===
     "point_target": {
-        "hit_threshold": 5.0,                  # V38: 50→5m, 与拦截器碰撞阈值对称(脱靶量<5m即命中)
+        "hit_threshold": 5.0,                  # V41: 5m 脱靶量命中HVT (与拦截阈值对称)
         "record_miss_distance": True,          # 逐步记录脱靶量
     },
 
