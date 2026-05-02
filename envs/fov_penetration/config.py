@@ -148,7 +148,7 @@ DEFAULT_CONFIG = {
         "passed_distance_abandon": 800.0,  # 飞越后拉开>800m → 彻底放弃
     },
 
-    "pn_nav_gain": 4,            # V25fix: 3→4, 提高PN侧向修正能力
+    "pn_nav_gain": 3,            # set PN navigation gain to 3 per server task
     "pn_direct_freq": 20.0,
     "pn_guide_freq": 5.0,        # V25fix: 2→5Hz, 保持低频但减少过大滞后
     "pn_extrapolate_horizon": 0.2,  # V26: 外推预测时间(秒), 用来补偿制导更新延迟

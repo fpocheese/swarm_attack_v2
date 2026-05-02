@@ -110,7 +110,7 @@ def main():
         print(f"Using obs phase mask: {obs_mask}")
     terminal_guidance = os.environ.get('FOV_TERMINAL_GUIDANCE', 'none').strip().lower()
     if terminal_guidance == 'pn_los':
-        pn_gain = float(os.environ.get('FOV_TERMINAL_PN_GAIN', '8.0'))
+        pn_gain = float(os.environ.get('FOV_TERMINAL_PN_GAIN', '3.0'))
         pn_max_action = float(os.environ.get('FOV_TERMINAL_PN_MAX_ACTION', '0.8'))
         env = TerminalPNActionWrapper(env, gain=pn_gain, max_action=pn_max_action)
         print(f"Using terminal guidance: pn_los gain={pn_gain} max_action={pn_max_action}")

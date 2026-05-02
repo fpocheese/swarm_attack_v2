@@ -77,7 +77,7 @@ def make_train_env(all_args):
     ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
     obs_phase_mask = getattr(all_args, 'obs_phase_mask', 'none')
     terminal_guidance = getattr(all_args, 'terminal_guidance', 'none')
-    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 8.0)
+    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 3.0)
     terminal_pn_max_action = getattr(all_args, 'terminal_pn_max_action', 0.8)
 
     def get_env_fn(rank):
@@ -102,7 +102,7 @@ def make_eval_env(all_args):
     ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
     obs_phase_mask = getattr(all_args, 'obs_phase_mask', 'none')
     terminal_guidance = getattr(all_args, 'terminal_guidance', 'none')
-    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 8.0)
+    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 3.0)
     terminal_pn_max_action = getattr(all_args, 'terminal_pn_max_action', 0.8)
 
     def get_env_fn(rank):
@@ -142,7 +142,7 @@ def parse_args(args, parser):
                         choices=['none', 'pn_los'],
                         help='Optional policy-layer terminal guidance. pn_los replaces terminal pitch/yaw with commands from HVT LOS-rate obs[5:7].')
     parser.add_argument('--terminal_pn_gain', type=float,
-                        default=float(os.environ.get('FOV_TERMINAL_PN_GAIN', '8.0')),
+                        default=float(os.environ.get('FOV_TERMINAL_PN_GAIN', '3.0')),
                         help='Gain for --terminal_guidance pn_los.')
     parser.add_argument('--terminal_pn_max_action', type=float,
                         default=float(os.environ.get('FOV_TERMINAL_PN_MAX_ACTION', '0.8')),

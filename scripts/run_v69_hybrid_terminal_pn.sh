@@ -29,7 +29,7 @@ RUN_SEED="${RUN_SEED:-6901}"
 export FOV_REWARD_PROFILE=v68strictpnfix
 export FOV_OBS_PHASE_MASK=v65_strict_los
 export FOV_TERMINAL_GUIDANCE=pn_los
-export FOV_TERMINAL_PN_GAIN=8.0
+export FOV_TERMINAL_PN_GAIN=3.0
 export FOV_TERMINAL_PN_MAX_ACTION=0.8
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=2
@@ -43,7 +43,7 @@ conda run --no-capture-output -n rlgpu python -u scripts/train_fov_penetration_m
   --ap_config v28 \
   --obs_phase_mask v65_strict_los \
   --terminal_guidance pn_los \
-  --terminal_pn_gain 8.0 \
+  --terminal_pn_gain 3.0 \
   --terminal_pn_max_action 0.8 \
   --cuda \
   --n_rollout_threads 40 \
