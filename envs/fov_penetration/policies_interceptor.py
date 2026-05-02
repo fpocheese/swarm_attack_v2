@@ -388,11 +388,29 @@ class InterceptorPolicy:
 
         dx = tx - intc.x
         dy = ty - intc.y
+        dz = tz - intc.z
         bearing_err = np.arctan2(dy, dx) - intc.heading
         bearing_err = np.arctan2(np.sin(bearing_err), np.cos(bearing_err))
 
+        range_norm = max(np.sqrt(dx**2 + dy**2 + dz**2), 1.0)
+        cos_g = np.cos(intc.gamma)
+        vx_i = intc.v * cos_g * np.cos(intc.heading)
+        vy_i = intc.v * cos_g * np.sin(intc.heading)
+        vz_i = intc.v * np.sin(intc.gamma)
+        if self.target_pos_known is not None:
+            vx_t = self.target_pos_known[3]
+            vy_t = self.target_pos_known[4]
+            vz_t = self.target_pos_known[5]
+        else:
+            vx_t, vy_t, vz_t = 0.0, 0.0, 0.0
+        dvx = vx_t - vx_i
+        dvy = vy_t - vy_i
+        dvz = vz_t - vz_i
+        current_closing_speed = -(dx * dvx + dy * dvy + dz * dvz) / range_norm
+        self.closing_speed = current_closing_speed
+
         # PN 在目标进入后半球时会退化，切换到纯追踪制导 (V31: 带回头退化)
-        if bearing_err > np.pi / 2 or bearing_err < -np.pi / 2 or self.closing_speed <= 0.0:
+        if bearing_err > np.pi / 2 or bearing_err < -np.pi / 2 or current_closing_speed <= 0.0:
             return self._pursuit_guidance_3d(tx, ty, tz)
 
         return self._pn_guidance_3d(tx, ty, tz, dt)
