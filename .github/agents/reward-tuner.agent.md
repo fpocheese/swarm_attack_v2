@@ -104,3 +104,60 @@ Workflow per iteration:
 ## Final note
 
 Your job is **not** to keep the agent "looking like it's improving" on TensorBoard — the only metric that matters is deterministic-eval `total_hits` and `min_d`. TB curves are advisory only.
+
+## Hard-won experience log (read BEFORE iterating)
+
+These are empirical findings from V44 → V59d. Treat as priors; do not re-discover them.
+
+### Compatible-checkpoint baseline ranking (deterministic, 3 seeds 1000/1001/1002)
+- **v59b u22 snapshot** (`outputs/results/fov_penetration/mappo/v59b_gentle_strike/run1/models_u22_snapshot`): **CURRENT SOTA**. closed_mean ≈ 1225–1281 m, A2 min_d 378 m / 472 m / 505 m, herr ≈ 50–53°. Use this as `--model_dir` for any new resume.
+- v45_kill_heading_freebie/run1: 1670 m / 53.5° / best min_d ≈ 700 m. Old SOTA, fall back to this if u22 ever breaks.
+- v44_remote_fresh/run3, v53, v56, v57, v58: all REGRESSED vs v45. Do not resume from these.
+
+### Reward-shaping anti-patterns (proven failures)
+1. **Stage-gated weights** (V58: heading_far=0.6, closing_far=0.7, near scale 2.5×) — compresses far-stage gradient, agents fly aggressively before reaching engagement, 3/4 die at step ≈ 3000. **NEVER** scale far-stage weights below 1.0.
+2. **Any non-trivial `lambda_near_strike` + sustained PPO** — destroys baseline within 20–80 updates regardless of lr:
+   - V59 (λ=10, lr=1.5e-5): peaked u17 closed=1517 m, regressed u41 to 878 m.
+   - V59b (λ=4, lr=1e-5, min_closing=8): peaked u22 closed=1281 m, regressed u34 to 968 m.
+   - V59c (λ=2, lr=5e-6, min_closing=12): regressed all the way to 703 m by u84. Even λ=2 + lr 5e-6 cannot hold the peak.
+3. **Lambda > 0 induces "terminal-aggressive drift"** — agents learn to commit early to terminal manoeuvre, exhaust energy, then die mid-flight. Reward correlation: `eval_average_episode_rewards` going more negative ≠ progress; it usually means more agents flew into kill range and died.
+
+### Operating rules learned the hard way
+- **Single-GPU rule (10 GB RTX 3080)**: only ONE `ppo_epoch ≥ 2` MAPPO trainer at a time. Two = OOM at update 0 (V58B). Use `n_rollout_threads=40, n_eval_rollout_threads=10, OMP/MKL_NUM_THREADS=2`.
+- **Snapshot at every peak**: `cp -r .../models .../models_u<N>_snapshot` BEFORE letting training continue past a diag-confirmed peak. Saves are overwritten every `save_interval`.
+- **`save_interval=1` for fragile fine-tunes**, =5 for exploratory runs. Without small interval the peak weights are lost.
+- **Use deterministic diag, not log eval, as ground truth**. Log eval is contaminated by kill penalties.
+- **Diag protocol**: invoke `/tmp/run_diag58.py` wrapper:
+  ```bash
+  MODEL_DIR=outputs/results/fov_penetration/mappo/<exp>/run1/models \
+    ~/miniconda3/bin/conda run -n rlgpu python /tmp/run_diag58.py 2>&1 | tail -45
+  ```
+  Wrapper sets `d.MODEL_DIR=os.environ['MODEL_DIR']; d.N_EP=3; d.main()`. Avoids the heredoc-quoting bug where local `$D` expansion silently re-runs v45.
+- **Clean-kill recipe**: `ssh swarm-235 'pkill -TERM -f mappo-fov-<exp_name>'`. Wait, then `nvidia-smi` should report < 500 MiB. Never use a pkill pattern that matches the launching ssh wrapper (self-kill hazard).
+- **Continuous-training mandate**: never leave GPU idle. Sequence is: launch new run → verify alive (PID + GPU > 600 MiB + log progressing) → THEN kill old run.
+- **matplotlib 3.x compat**: `fig.canvas.tostring_rgb()` is gone. Use `np.asarray(fig.canvas.buffer_rgba())[..., :3]`.
+- **Remote SSH alias**: `swarm-235` → a2rl@192.168.1.56 (was .142, .235; check `~/.ssh/config`). Project at `~/000000GSY_mutiUAV/swarm_attack_v2`. Conda at `~/miniconda3`.
+
+### Reward profile catalog (`FOV_REWARD_PROFILE` env var → `config.py::get_config`)
+| Profile | λ_near_strike | active_dist | min_closing | Verdict |
+|---|---|---|---|---|
+| (unset / default) | 0 | — | — | Pure v45. Safest, lowest ceiling. |
+| `v56a` | 20 | 1e9 | -1e9 | Unreliable old. |
+| `v58a` | 12 | 160 | 5 | + stage scaling. **REGRESSES**. |
+| `v58b` | 12 | — | — | OOM-prone. |
+| `v59` | 10 | 200 | 0 | Brief peak then regress. |
+| `v59b` | 4 | 180 | 8 | **Best λ profile so far** (u22 SOTA). |
+| `v59c` | 2 | 150 | 12 | Regresses; even tiny λ corrupts. |
+
+### Promising directions NOT yet tried (next-iteration hypotheses)
+1. **Pure-v45 ultra-slow protective fine-tune from u22** (v59d, currently running): no λ at all, lr 3e-6, clip 0.05, ppo_epoch 2. Goal: hold u22 without drift while exploring whether the v45 reward alone can squeeze min_d further.
+2. **Terminal-only reward, gated on `min_d` history** — only fire reward when an agent is BOTH inside `active_dist` AND its trailing `min_d` is monotonically decreasing. Prevents "loitering near 200 m for free reward".
+3. **Per-agent role split via observation, not via reward** — let one agent be designated primary striker each episode (already in obs as identity); add a tiny `lambda_primary_strike` (≤ 1.0) only on that one agent. Reduces 4× redundant aggression that kills the swarm.
+4. **Adaptive entropy decay** — start entropy 0.01, anneal to 0.002 over 50 updates. Prevents the explore→commit→die cycle.
+5. **Curriculum on `interceptor_strength`** — env owner has frozen the hit/kill thresholds, but the per-policy interceptor agent count or activation timing may be configurable via scenario param (CHECK FIRST, ASK USER). If not, skip.
+
+### Decision matrix for "what to do next"
+- u22 still best AND no candidate beats it for 3 consecutive iterations → STOP iterating reward, focus on **terminal-only gated bonus** (direction 2) or report u22 as final.
+- New iteration matches u22 within ±10% but herr drops below 35° → snapshot, continue, it's converging.
+- New iteration regresses closed_mean by >20% in 2 evals → REVERT, halve λ or lr.
+- Any sustained run shows agents dying earlier than step 4000 in all 3 seeds → stop, the reward is inducing aggressive drift.

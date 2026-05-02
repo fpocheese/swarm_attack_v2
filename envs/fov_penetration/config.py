@@ -30,6 +30,7 @@ V21 核心修复:
 
 import numpy as np
 import copy
+import os
 
 G = 9.81
 
@@ -181,7 +182,11 @@ DEFAULT_CONFIG = {
         # V45: 0.3→0.05 杀掉 spawn-heading 直对 HVT 时 trim 白嫖 +0.3/step,
         # heading 仍由 lambda_heading_error_penalty=0.2 兜底
         "lambda_heading_align": 0.05,
-        "lambda_gamma_align": 0.2,
+        # V47: gamma_align 0.2 -> 0.05, kill remaining spawn-step trim freebie.
+        # 远端定量分解显示零动作出生一步里 gamma_align 单项约 +0.198,
+        # 明显大于 approach(+0.022)、closing(+0.056) 和 team_progress(+0.030)，
+        # 仍在奖励“近似平飞朝前”而不是末端收口机动。
+        "lambda_gamma_align": 0.05,
         "lambda_heading_error_penalty": 0.2,
 
         # --- 核心: 闭合速度 (V44: 0.4→0.15) ---
@@ -201,9 +206,85 @@ DEFAULT_CONFIG = {
         "lambda_overshoot": 5.0,
         "overshoot_trigger_dist": 800.0,
 
-        # --- V44 新增 (B): 末端 exp(-d/σ) 稠密引导, 远场≈0, 近场放量 ---
+        # --- V44/V47: 保持 dense 覆盖到 ~180m 档, 避免过早抽空末端吸引力 ---
         "lambda_proximity_dense": 8.0,
         "proximity_dense_sigma": 200.0,
+
+        # --- V56A 新增: 近距尖峰奖励 (default 0 = 关; 由 FOV_REWARD_PROFILE=v56A 打开) ---
+        # exp(-(d/sigma)^2): d=200m→~0, 50m→0.062, 20m→0.64, 5m→0.97
+        # 用来填补 v45 已经能稳定到 ~200m 但卡在 5m 命中的 gap
+        "lambda_near_strike": 0.0,
+        "near_strike_sigma": 30.0,
+
+        # --- V58: 分阶段门控 + 主攻责任 (默认尽量中性, 由 profile 打开) ---
+        "stage_far_dist": 900.0,
+        "stage_near_dist": 180.0,
+
+        "approach_stage_scale_far": 1.0,
+        "approach_stage_scale_mid": 1.0,
+        "approach_stage_scale_near": 1.0,
+        "heading_stage_scale_far": 1.0,
+        "heading_stage_scale_mid": 1.0,
+        "heading_stage_scale_near": 1.0,
+        "gamma_stage_scale_far": 1.0,
+        "gamma_stage_scale_mid": 1.0,
+        "gamma_stage_scale_near": 1.0,
+        "heading_penalty_stage_scale_far": 1.0,
+        "heading_penalty_stage_scale_mid": 1.0,
+        "heading_penalty_stage_scale_near": 1.0,
+        "closing_stage_scale_far": 1.0,
+        "closing_stage_scale_mid": 1.0,
+        "closing_stage_scale_near": 1.0,
+        "no_retreat_stage_scale_far": 1.0,
+        "no_retreat_stage_scale_mid": 1.0,
+        "no_retreat_stage_scale_near": 1.0,
+        "proximity_stage_scale_far": 1.0,
+        "proximity_stage_scale_mid": 1.0,
+        "proximity_stage_scale_near": 1.0,
+        "dense_stage_scale_far": 1.0,
+        "dense_stage_scale_mid": 1.0,
+        "dense_stage_scale_near": 1.0,
+        "near_strike_stage_scale_far": 1.0,
+        "near_strike_stage_scale_mid": 1.0,
+        "near_strike_stage_scale_near": 1.0,
+        "lateral_miss_stage_scale_far": 1.0,
+        "lateral_miss_stage_scale_mid": 1.0,
+        "lateral_miss_stage_scale_near": 1.0,
+
+        "near_strike_active_dist": 1.0e9,
+        "near_strike_min_closing": -1.0e9,
+        "near_strike_negative_scale": 1.0,
+        "lambda_lateral_miss": 0.0,
+        "lateral_miss_active_dist": 300.0,
+        "overshoot_near_boost": 1.0,
+
+        "team_primary_scale": 1.0,
+        "team_support_scale": 1.0,
+        "lambda_primary_delta_progress": 0.0,
+        "primary_regress_scale": 1.5,
+
+        # --- V60: phase-role shaping (default off) ---
+        "lambda_phase_terminal_los": 0.0,
+        "phase_terminal_los_sigma": 0.08,
+        "lambda_phase_terminal_progress": 0.0,
+        "lambda_phase_terminal_pn_action": 0.0,
+        "phase_terminal_pn_gain": 4.0,
+        "phase_terminal_pn_obs_gain": 0.0,
+        "phase_terminal_pn_err_scale": 1.0,
+        "phase_terminal_pn_align_scale": 1.0,
+        "phase_terminal_pn_active_dist": 1400.0,
+        "phase_terminal_pn_min_gate": 0.20,
+        "phase_terminal_pn_max_action": 0.90,
+        "phase_terminal_pn_deadband": 0.005,
+        "phase_terminal_pn_score_clip": 1.0,
+        "phase_terminal_pn_closing_ref": 45.0,
+        "phase_nonprimary_terminal_scale": 0.15,
+        "lambda_phase_decoy_lock": 0.0,
+        "lambda_phase_primary_lock_penalty": 0.0,
+
+        # --- Optional hard phase split: neutral by default. ---
+        "legacy_phase_scale_penetration": 1.0,
+        "legacy_phase_scale_terminal": 1.0,
 
         # --- 距离惩罚 (V44: 0.15→0.05, 与 dense bonus 解耦) ---
         "lambda_proximity": 0.05,
@@ -383,4 +464,482 @@ def get_config(custom_config=None, scenario=None):
                 config[key].update(value)
             else:
                 config[key] = value
+    # --- V56: per-process reward profile via FOV_REWARD_PROFILE env var.
+    # 让多条并行实验共用同一份代码却各走一份 reward block, 不必改 config.py.
+    profile = os.environ.get("FOV_REWARD_PROFILE", "").strip().lower()
+    if profile == "v56a":
+        config["reward"]["lambda_near_strike"] = 20.0
+        config["reward"]["near_strike_sigma"] = 30.0
+    elif profile == "v58a":
+        r = config["reward"]
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.8
+        r["team_support_scale"] = 0.4
+        r["lambda_primary_delta_progress"] = 4.0
+
+        r["approach_stage_scale_far"] = 1.2
+        r["approach_stage_scale_mid"] = 0.8
+        r["approach_stage_scale_near"] = 0.35
+        r["heading_stage_scale_far"] = 0.6
+        r["heading_stage_scale_mid"] = 1.4
+        r["heading_stage_scale_near"] = 2.2
+        r["gamma_stage_scale_far"] = 0.6
+        r["gamma_stage_scale_mid"] = 1.2
+        r["gamma_stage_scale_near"] = 1.8
+        r["heading_penalty_stage_scale_far"] = 0.8
+        r["heading_penalty_stage_scale_mid"] = 1.2
+        r["heading_penalty_stage_scale_near"] = 2.0
+        r["closing_stage_scale_far"] = 0.7
+        r["closing_stage_scale_mid"] = 1.2
+        r["closing_stage_scale_near"] = 1.8
+        r["no_retreat_stage_scale_far"] = 1.0
+        r["no_retreat_stage_scale_mid"] = 1.4
+        r["no_retreat_stage_scale_near"] = 2.2
+        r["proximity_stage_scale_far"] = 1.0
+        r["proximity_stage_scale_mid"] = 0.8
+        r["proximity_stage_scale_near"] = 0.3
+        r["dense_stage_scale_far"] = 0.4
+        r["dense_stage_scale_mid"] = 1.1
+        r["dense_stage_scale_near"] = 1.8
+        r["near_strike_stage_scale_far"] = 0.0
+        r["near_strike_stage_scale_mid"] = 0.8
+        r["near_strike_stage_scale_near"] = 2.5
+        r["lateral_miss_stage_scale_far"] = 0.4
+        r["lateral_miss_stage_scale_mid"] = 1.3
+        r["lateral_miss_stage_scale_near"] = 2.0
+
+        r["lambda_near_strike"] = 12.0
+        r["near_strike_sigma"] = 28.0
+        r["near_strike_active_dist"] = 160.0
+        r["near_strike_min_closing"] = 5.0
+        r["near_strike_negative_scale"] = 0.1
+        r["lambda_lateral_miss"] = 1.2
+        r["lateral_miss_active_dist"] = 280.0
+        r["overshoot_near_boost"] = 2.0
+    elif profile == "v58b":
+        r = config["reward"]
+        r["lambda_team_min_progress"] = 1.5
+        r["team_primary_scale"] = 2.0
+        r["team_support_scale"] = 0.25
+        r["lambda_primary_delta_progress"] = 5.5
+
+        r["approach_stage_scale_far"] = 1.1
+        r["approach_stage_scale_mid"] = 0.7
+        r["approach_stage_scale_near"] = 0.25
+        r["heading_stage_scale_far"] = 0.5
+        r["heading_stage_scale_mid"] = 1.5
+        r["heading_stage_scale_near"] = 2.6
+        r["gamma_stage_scale_far"] = 0.5
+        r["gamma_stage_scale_mid"] = 1.3
+        r["gamma_stage_scale_near"] = 2.2
+        r["heading_penalty_stage_scale_far"] = 0.8
+        r["heading_penalty_stage_scale_mid"] = 1.4
+        r["heading_penalty_stage_scale_near"] = 2.3
+        r["closing_stage_scale_far"] = 0.7
+        r["closing_stage_scale_mid"] = 1.3
+        r["closing_stage_scale_near"] = 2.2
+        r["no_retreat_stage_scale_far"] = 1.0
+        r["no_retreat_stage_scale_mid"] = 1.5
+        r["no_retreat_stage_scale_near"] = 2.6
+        r["proximity_stage_scale_far"] = 1.0
+        r["proximity_stage_scale_mid"] = 0.7
+        r["proximity_stage_scale_near"] = 0.2
+        r["dense_stage_scale_far"] = 0.3
+        r["dense_stage_scale_mid"] = 1.0
+        r["dense_stage_scale_near"] = 2.0
+        r["near_strike_stage_scale_far"] = 0.0
+        r["near_strike_stage_scale_mid"] = 1.0
+        r["near_strike_stage_scale_near"] = 3.0
+        r["lateral_miss_stage_scale_far"] = 0.4
+        r["lateral_miss_stage_scale_mid"] = 1.4
+        r["lateral_miss_stage_scale_near"] = 2.4
+
+        r["lambda_near_strike"] = 18.0
+        r["near_strike_sigma"] = 22.0
+        r["near_strike_active_dist"] = 180.0
+        r["near_strike_min_closing"] = 8.0
+        r["near_strike_negative_scale"] = 0.0
+        r["lambda_lateral_miss"] = 1.8
+        r["lateral_miss_active_dist"] = 320.0
+        r["overshoot_near_boost"] = 2.5
+    elif profile == "v59":
+        # v59: 完全保留 v45 reward, 仅追加一个温和的近距命中奖励 (terminal nudge).
+        # 不分阶段, 不分主辅, 不加横偏惩罚 — 避免 v58 的远距权重坍塌.
+        r = config["reward"]
+        r["lambda_near_strike"] = 10.0
+        r["near_strike_sigma"] = 30.0
+        r["near_strike_active_dist"] = 200.0
+        r["near_strike_min_closing"] = 0.0
+        r["near_strike_negative_scale"] = 0.0
+    elif profile == "v59b":
+        # v59b: v59 在 u17 表现很好 (closed=1517m, herr=36.7), 但 u41 退化
+        # (closed=878m, agents 在 step~3000 阵亡). 推断 lambda=10 + lr=1.5e-5
+        # 持续 PPO 后 policy 漂向 terminal-aggressive. v59b 大幅降低近距奖励
+        # 强度并要求显著正向接近, 配合更低 lr / 更高 entropy / 更短 save 间隔.
+        r = config["reward"]
+        r["lambda_near_strike"] = 4.0
+        r["near_strike_sigma"] = 30.0
+        r["near_strike_active_dist"] = 180.0
+        r["near_strike_min_closing"] = 8.0
+        r["near_strike_negative_scale"] = 0.0
+    elif profile == "v59c":
+        # v59c: v59b u22 也是峰值后退化. 在 u22 周围做微调 — 极小 lambda,
+        # 极慢 lr, 高 entropy, 严格要求接近 (min_closing=12) 避免空滑奖励.
+        r = config["reward"]
+        r["lambda_near_strike"] = 2.0
+        r["near_strike_sigma"] = 30.0
+        r["near_strike_active_dist"] = 150.0
+        r["near_strike_min_closing"] = 12.0
+        r["near_strike_negative_scale"] = 0.0
+    elif profile == "v60phase":
+        # v60phase: user-directed redesign. Before crossing the defender line,
+        # learn decoy/cover and threat avoidance; after crossing it, learn a
+        # PN-like terminal attack from HVT LOS angular-rate observations.
+        r = config["reward"]
+        r["lambda_near_strike"] = 0.0
+        r["lambda_lateral_miss"] = 0.0
+        r["lambda_proximity_dense"] = 4.0
+
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.5
+        r["team_support_scale"] = 0.25
+        r["lambda_primary_delta_progress"] = 2.0
+        r["primary_regress_scale"] = 2.0
+
+        r["lambda_phase_terminal_los"] = 2.5
+        r["phase_terminal_los_sigma"] = 0.08
+        r["lambda_phase_terminal_progress"] = 4.0
+        r["phase_nonprimary_terminal_scale"] = 0.10
+        r["lambda_phase_decoy_lock"] = 0.08
+        r["lambda_phase_primary_lock_penalty"] = 0.05
+
+        r["lambda_mu_regularize"] = 0.03
+        r["yaw_reg_relax_dist"] = 500.0
+        r["yaw_reg_near_factor"] = 0.05
+    elif profile == "v61hardphase":
+        # v61hardphase: make the user's two-phase idea strict. Before the
+        # defender line, keep penetration/decoy shaping. After crossing it,
+        # suppress legacy HVT approach/heading/dense shaping and train only
+        # PN-like terminal attack rewards.
+        r = config["reward"]
+        r["lambda_near_strike"] = 0.0
+        r["lambda_lateral_miss"] = 0.0
+        r["lambda_proximity_dense"] = 0.0
+
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.4
+        r["team_support_scale"] = 0.20
+        r["lambda_primary_delta_progress"] = 1.5
+        r["primary_regress_scale"] = 2.0
+
+        r["legacy_phase_scale_penetration"] = 1.0
+        r["legacy_phase_scale_terminal"] = 0.0
+        r["dense_phase_scale_penetration"] = 0.0
+        r["near_strike_phase_scale_penetration"] = 0.0
+        r["lateral_miss_phase_scale_penetration"] = 0.0
+        r["yaw_reg_phase_scale_terminal"] = 0.0
+
+        r["lambda_phase_terminal_los"] = 4.0
+        r["phase_terminal_los_sigma"] = 0.06
+        r["lambda_phase_terminal_progress"] = 6.0
+        r["phase_nonprimary_terminal_scale"] = 0.05
+        r["lambda_phase_decoy_lock"] = 0.10
+        r["lambda_phase_primary_lock_penalty"] = 0.12
+
+        r["lambda_mu_regularize"] = 0.02
+        r["yaw_reg_relax_dist"] = 600.0
+        r["yaw_reg_near_factor"] = 0.05
+    elif profile == "v62terminaldense":
+        # v62terminaldense: keep the strict observation/reward phase split, but
+        # restore HVT range attraction only inside terminal attack. Penetration
+        # remains threat/decoy/progress driven; terminal becomes LOS-rate +
+        # positive progress + terminal-only dense/near-strike hit shaping.
+        r = config["reward"]
+        r["lambda_proximity_dense"] = 3.0
+        r["lambda_near_strike"] = 2.0
+        r["near_strike_sigma"] = 30.0
+        r["near_strike_active_dist"] = 180.0
+        r["near_strike_min_closing"] = 8.0
+        r["near_strike_negative_scale"] = 0.0
+        r["lambda_lateral_miss"] = 0.0
+
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.35
+        r["team_support_scale"] = 0.20
+        r["lambda_primary_delta_progress"] = 1.5
+        r["primary_regress_scale"] = 2.0
+
+        r["legacy_phase_scale_penetration"] = 1.0
+        r["legacy_phase_scale_terminal"] = 0.0
+        r["dense_phase_scale_penetration"] = 0.0
+        r["dense_phase_scale_terminal"] = 1.0
+        r["near_strike_phase_scale_penetration"] = 0.0
+        r["near_strike_phase_scale_terminal"] = 1.0
+        r["lateral_miss_phase_scale_penetration"] = 0.0
+        r["lateral_miss_phase_scale_terminal"] = 0.0
+        r["yaw_reg_phase_scale_terminal"] = 0.0
+
+        r["lambda_phase_terminal_los"] = 3.5
+        r["phase_terminal_los_sigma"] = 0.07
+        r["lambda_phase_terminal_progress"] = 8.0
+        r["phase_nonprimary_terminal_scale"] = 0.05
+        r["lambda_phase_decoy_lock"] = 0.08
+        r["lambda_phase_primary_lock_penalty"] = 0.08
+
+        r["lambda_mu_regularize"] = 0.02
+        r["yaw_reg_relax_dist"] = 650.0
+        r["yaw_reg_near_factor"] = 0.05
+    elif profile == "v63pnaction":
+        # v63pnaction: terminal obs contains only HVT LOS angular rates, so add
+        # a terminal-only PN action-consistency reward. Distance/near rewards are
+        # kept modest and terminal-gated; penetration remains threat/decoy driven.
+        r = config["reward"]
+        r["lambda_proximity_dense"] = 2.0
+        r["proximity_dense_sigma"] = 260.0
+        r["lambda_near_strike"] = 1.0
+        r["near_strike_sigma"] = 35.0
+        r["near_strike_active_dist"] = 220.0
+        r["near_strike_min_closing"] = 6.0
+        r["near_strike_negative_scale"] = 0.0
+        r["lambda_lateral_miss"] = 0.0
+
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.35
+        r["team_support_scale"] = 0.20
+        r["lambda_primary_delta_progress"] = 1.5
+        r["primary_regress_scale"] = 2.0
+
+        r["legacy_phase_scale_penetration"] = 1.0
+        r["legacy_phase_scale_terminal"] = 0.0
+        r["dense_phase_scale_penetration"] = 0.0
+        r["dense_phase_scale_terminal"] = 1.0
+        r["near_strike_phase_scale_penetration"] = 0.0
+        r["near_strike_phase_scale_terminal"] = 1.0
+        r["lateral_miss_phase_scale_penetration"] = 0.0
+        r["lateral_miss_phase_scale_terminal"] = 0.0
+        r["yaw_reg_phase_scale_terminal"] = 0.0
+
+        r["lambda_phase_terminal_los"] = 2.0
+        r["phase_terminal_los_sigma"] = 0.08
+        r["lambda_phase_terminal_progress"] = 8.0
+        r["lambda_phase_terminal_pn_action"] = 2.5
+        r["phase_terminal_pn_gain"] = 4.0
+        r["phase_terminal_pn_active_dist"] = 1500.0
+        r["phase_terminal_pn_min_gate"] = 0.25
+        r["phase_terminal_pn_max_action"] = 0.90
+        r["phase_terminal_pn_deadband"] = 0.004
+        r["phase_terminal_pn_score_clip"] = 1.0
+        r["phase_terminal_pn_closing_ref"] = 45.0
+        r["phase_nonprimary_terminal_scale"] = 0.05
+        r["lambda_phase_decoy_lock"] = 0.08
+        r["lambda_phase_primary_lock_penalty"] = 0.08
+
+        r["lambda_mu_regularize"] = 0.02
+        r["yaw_reg_relax_dist"] = 650.0
+        r["yaw_reg_near_factor"] = 0.05
+    elif profile == "v64losaction":
+        # v64losaction: stronger terminal-only LOS-rate action shaping. Uses the
+        # same terminal observation variables (d_az, d_el) to set direct pitch/yaw
+        # action targets, so the actor gets a useful gradient before 200m.
+        r = config["reward"]
+        r["lambda_proximity_dense"] = 1.5
+        r["proximity_dense_sigma"] = 300.0
+        r["lambda_near_strike"] = 0.8
+        r["near_strike_sigma"] = 40.0
+        r["near_strike_active_dist"] = 240.0
+        r["near_strike_min_closing"] = 5.0
+        r["near_strike_negative_scale"] = 0.0
+        r["lambda_lateral_miss"] = 0.0
+
+        r["lambda_team_min_progress"] = 2.0
+        r["team_primary_scale"] = 1.30
+        r["team_support_scale"] = 0.20
+        r["lambda_primary_delta_progress"] = 1.5
+        r["primary_regress_scale"] = 2.0
+
+        r["legacy_phase_scale_penetration"] = 1.0
+        r["legacy_phase_scale_terminal"] = 0.0
+        r["dense_phase_scale_penetration"] = 0.0
+        r["dense_phase_scale_terminal"] = 1.0
+        r["near_strike_phase_scale_penetration"] = 0.0
+        r["near_strike_phase_scale_terminal"] = 1.0
+        r["lateral_miss_phase_scale_penetration"] = 0.0
+        r["lateral_miss_phase_scale_terminal"] = 0.0
+        r["yaw_reg_phase_scale_terminal"] = 0.0
+
+        r["lambda_phase_terminal_los"] = 1.5
+        r["phase_terminal_los_sigma"] = 0.09
+        r["lambda_phase_terminal_progress"] = 6.0
+        r["lambda_phase_terminal_pn_action"] = 8.0
+        r["phase_terminal_pn_obs_gain"] = 3.0
+        r["phase_terminal_pn_err_scale"] = 0.45
+        r["phase_terminal_pn_align_scale"] = 1.0
+        r["phase_terminal_pn_active_dist"] = 1700.0
+        r["phase_terminal_pn_min_gate"] = 0.35
+        r["phase_terminal_pn_max_action"] = 0.95
+        r["phase_terminal_pn_deadband"] = 0.003
+        r["phase_terminal_pn_score_clip"] = 1.5
+        r["phase_terminal_pn_closing_ref"] = 45.0
+        r["phase_nonprimary_terminal_scale"] = 0.05
+        r["lambda_phase_decoy_lock"] = 0.08
+        r["lambda_phase_primary_lock_penalty"] = 0.08
+
+        r["lambda_mu_regularize"] = 0.02
+        r["yaw_reg_relax_dist"] = 650.0
+        r["yaw_reg_near_factor"] = 0.05
+    elif profile in ("v65strictlos", "v66terminalstrike", "v67strictpncpa", "v68strictpnfix"):
+        # v65strictlos: hard two-phase isolation per user request.
+        # Penetration has no HVT attack guidance in obs and no HVT approach
+        # rewards; terminal has only HVT LOS-rate obs and HVT hit/approach
+        # rewards, with no opponent/team observation.
+        r = config["reward"]
+
+        # Disable legacy HVT approach/heading/closing/distance in both phases.
+        # Penetration is driven only by decoy/lock/survival-like terms; terminal
+        # uses explicit phase_terminal_* and terminal-gated dense/near terms.
+        r["legacy_phase_scale_penetration"] = 0.0
+        r["legacy_phase_scale_terminal"] = 0.0
+        r["approach_phase_scale_penetration"] = 0.0
+        r["heading_phase_scale_penetration"] = 0.0
+        r["gamma_phase_scale_penetration"] = 0.0
+        r["heading_penalty_phase_scale_penetration"] = 0.0
+        r["closing_phase_scale_penetration"] = 0.0
+        r["no_retreat_phase_scale_penetration"] = 0.0
+        r["proximity_phase_scale_penetration"] = 0.0
+        r["overshoot_phase_scale_penetration"] = 0.0
+        r["team_progress_phase_scale_penetration"] = 0.0
+        r["primary_delta_phase_scale_penetration"] = 0.0
+        r["yaw_reg_phase_scale_penetration"] = 1.0
+        r["yaw_reg_phase_scale_terminal"] = 0.0
+
+        r["lambda_team_min_progress"] = 0.0
+        r["lambda_primary_delta_progress"] = 0.0
+        r["team_primary_scale"] = 1.0
+        r["team_support_scale"] = 0.0
+
+        r["lambda_proximity_dense"] = 2.0
+        r["proximity_dense_sigma"] = 320.0
+        r["dense_phase_scale_penetration"] = 0.0
+        r["dense_phase_scale_terminal"] = 1.0
+
+        r["lambda_near_strike"] = 1.2
+        r["near_strike_sigma"] = 45.0
+        r["near_strike_active_dist"] = 260.0
+        r["near_strike_min_closing"] = 4.0
+        r["near_strike_negative_scale"] = 0.0
+        r["near_strike_phase_scale_penetration"] = 0.0
+        r["near_strike_phase_scale_terminal"] = 1.0
+
+        r["lambda_lateral_miss"] = 0.0
+        r["lateral_miss_phase_scale_penetration"] = 0.0
+        r["lateral_miss_phase_scale_terminal"] = 0.0
+
+        r["lambda_phase_terminal_los"] = 3.0
+        r["phase_terminal_los_sigma"] = 0.08
+        r["lambda_phase_terminal_progress"] = 12.0
+        r["lambda_phase_terminal_pn_action"] = 0.0
+        r["phase_nonprimary_terminal_scale"] = 0.05
+
+        r["lambda_phase_decoy_lock"] = 0.20
+        r["lambda_phase_primary_lock_penalty"] = 0.20
+        r["lambda_mu_regularize"] = 0.02
+        r["yaw_reg_relax_dist"] = 650.0
+        r["yaw_reg_near_factor"] = 0.05
+
+        # Avoid end-of-episode HVT-distance leakage outside terminal shaping.
+        r["lambda_terminal_dist"] = 0.0
+        r["timeout_distance_penalty_coef"] = 0.0
+
+        if profile == "v66terminalstrike":
+            # v66terminalstrike: keep v65 strict phase isolation, but turn near
+            # terminal misses into hits by sharpening only terminal-stage HVT
+            # precision rewards and strengthening penetration decoy cover.
+            r["lambda_proximity_dense"] = 3.0
+            r["proximity_dense_sigma"] = 260.0
+            r["lambda_near_strike"] = 10.0
+            r["near_strike_sigma"] = 28.0
+            r["near_strike_active_dist"] = 240.0
+            r["near_strike_min_closing"] = 0.0
+            r["near_strike_negative_scale"] = 0.0
+            r["lambda_phase_terminal_los"] = 6.0
+            r["phase_terminal_los_sigma"] = 0.045
+            r["lambda_phase_terminal_progress"] = 24.0
+            r["phase_nonprimary_terminal_scale"] = 0.02
+            r["lambda_phase_decoy_lock"] = 0.45
+            r["lambda_phase_primary_lock_penalty"] = 0.45
+            r["lambda_mu_regularize"] = 0.015
+
+        if profile == "v67strictpncpa":
+            # v67strictpncpa: strict v65 observation split, with terminal-only
+            # proportional-navigation action shaping and terminal CPA precision.
+            r["lambda_proximity_dense"] = 2.5
+            r["proximity_dense_sigma"] = 280.0
+            r["lambda_near_strike"] = 2.5
+            r["near_strike_sigma"] = 35.0
+            r["near_strike_active_dist"] = 280.0
+            r["near_strike_min_closing"] = 0.0
+            r["near_strike_negative_scale"] = 0.0
+            r["lambda_phase_terminal_los"] = 4.5
+            r["phase_terminal_los_sigma"] = 0.055
+            r["lambda_phase_terminal_progress"] = 14.0
+            r["lambda_phase_terminal_pn_action"] = 12.0
+            r["phase_terminal_pn_obs_gain"] = 4.0
+            r["phase_terminal_pn_err_scale"] = 0.80
+            r["phase_terminal_pn_align_scale"] = 1.20
+            r["phase_terminal_pn_active_dist"] = 1700.0
+            r["phase_terminal_pn_min_gate"] = 0.45
+            r["phase_terminal_pn_max_action"] = 0.90
+            r["phase_terminal_pn_deadband"] = 0.002
+            r["phase_terminal_pn_score_clip"] = 1.8
+            r["phase_terminal_pn_closing_ref"] = 45.0
+            r["lambda_phase_terminal_cpa"] = 14.0
+            r["phase_terminal_cpa_sigma"] = 22.0
+            r["phase_terminal_cpa_active_dist"] = 1300.0
+            r["phase_terminal_cpa_min_gate"] = 0.35
+            r["phase_terminal_cpa_min_closing"] = 2.0
+            r["phase_terminal_cpa_closing_ref"] = 45.0
+            r["terminal_cpa_phase_scale_penetration"] = 0.0
+            r["terminal_cpa_phase_scale_terminal"] = 1.0
+            r["phase_nonprimary_terminal_scale"] = 0.03
+            r["lambda_phase_decoy_lock"] = 0.25
+            r["lambda_phase_primary_lock_penalty"] = 0.25
+            r["lambda_mu_regularize"] = 0.015
+
+        if profile == "v68strictpnfix":
+            # v68strictpnfix: v67 with corrected LOS-rate action sign. Direct
+            # terminal override tests showed action = -gain * [d_el, d_az]
+            # reaches the 5m hit radius while the previous sign diverges.
+            r["lambda_proximity_dense"] = 2.0
+            r["proximity_dense_sigma"] = 300.0
+            r["lambda_near_strike"] = 2.0
+            r["near_strike_sigma"] = 35.0
+            r["near_strike_active_dist"] = 280.0
+            r["near_strike_min_closing"] = 0.0
+            r["near_strike_negative_scale"] = 0.0
+            r["lambda_phase_terminal_los"] = 4.0
+            r["phase_terminal_los_sigma"] = 0.06
+            r["lambda_phase_terminal_progress"] = 12.0
+            r["lambda_phase_terminal_pn_action"] = 36.0
+            r["phase_terminal_pn_obs_gain"] = 8.0
+            r["phase_terminal_pn_obs_sign"] = -1.0
+            r["phase_terminal_pn_err_scale"] = 1.20
+            r["phase_terminal_pn_align_scale"] = 1.60
+            r["phase_terminal_pn_active_dist"] = 1700.0
+            r["phase_terminal_pn_min_gate"] = 0.55
+            r["phase_terminal_pn_max_action"] = 0.80
+            r["phase_terminal_pn_deadband"] = 0.002
+            r["phase_terminal_pn_score_clip"] = 2.0
+            r["phase_terminal_pn_closing_ref"] = 45.0
+            r["lambda_phase_terminal_cpa"] = 18.0
+            r["phase_terminal_cpa_sigma"] = 16.0
+            r["phase_terminal_cpa_active_dist"] = 1300.0
+            r["phase_terminal_cpa_min_gate"] = 0.45
+            r["phase_terminal_cpa_min_closing"] = 0.0
+            r["phase_terminal_cpa_closing_ref"] = 45.0
+            r["terminal_cpa_phase_scale_penetration"] = 0.0
+            r["terminal_cpa_phase_scale_terminal"] = 1.0
+            r["phase_nonprimary_terminal_scale"] = 0.02
+            r["lambda_phase_decoy_lock"] = 0.20
+            r["lambda_phase_primary_lock_penalty"] = 0.20
+            r["lambda_mu_regularize"] = 0.012
     return config

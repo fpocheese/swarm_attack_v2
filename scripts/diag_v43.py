@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from envs.fov_penetration import FOVPenetrationEnv
 from eval_v28_10episodes import load_policies
+from scripts.phase_obs_wrapper import PhaseMaskedFOVWrapper
+from scripts.terminal_pn_action_wrapper import TerminalPNActionWrapper
 
 MODEL_DIR = "outputs/results/fov_penetration/mappo/v44_reward_reshape/run1/models"
 HIDDEN = 256
@@ -52,14 +54,17 @@ def run_episode(env, policies, device, seed):
     final_step = 0
     for step in range(N_STEPS):
         actions, rnn = get_actions(policies, obs, device, HIDDEN, rnn, masks)
-        obs, _, _, _, dones, _, _ = env.step(actions)
+        executed_actions = actions
+        if hasattr(env, 'guide_actions'):
+            executed_actions, _ = env.guide_actions(actions)
+        obs, _, _, _, dones, _, _ = env.step(executed_actions)
         final_step = step + 1
 
         for i, off in enumerate(env.offensives):
             if not off.alive:
                 continue
             cnt_alive_steps[i] += 1
-            sum_act[i] += np.array(actions[i])
+            sum_act[i] += np.array(executed_actions[i])
             d = off.distance_to(hvt.x, hvt.y, hvt.z)
             if d < min_d[i]:
                 min_d[i] = d
@@ -99,6 +104,16 @@ def run_episode(env, policies, device, seed):
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     env = FOVPenetrationEnv(scenario='scenario_1')
+    obs_mask = os.environ.get('FOV_OBS_PHASE_MASK', 'none').strip().lower()
+    if obs_mask != 'none':
+        env = PhaseMaskedFOVWrapper(env, mode=obs_mask)
+        print(f"Using obs phase mask: {obs_mask}")
+    terminal_guidance = os.environ.get('FOV_TERMINAL_GUIDANCE', 'none').strip().lower()
+    if terminal_guidance == 'pn_los':
+        pn_gain = float(os.environ.get('FOV_TERMINAL_PN_GAIN', '8.0'))
+        pn_max_action = float(os.environ.get('FOV_TERMINAL_PN_MAX_ACTION', '0.8'))
+        env = TerminalPNActionWrapper(env, gain=pn_gain, max_action=pn_max_action)
+        print(f"Using terminal guidance: pn_los gain={pn_gain} max_action={pn_max_action}")
     print(f"Loading policies from {MODEL_DIR} (device={device})")
     policies = load_policies(MODEL_DIR, env, device, hidden_size=HIDDEN, layer_N=LAYER_N)
     results = []

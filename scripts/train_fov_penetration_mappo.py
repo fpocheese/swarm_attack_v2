@@ -22,6 +22,8 @@ import torch
 from macpo.config import get_config
 from macpo.envs.env_wrappers import ShareSubprocVecEnv, ShareDummyVecEnv
 from envs.fov_penetration import FOVPenetrationEnv
+from scripts.phase_obs_wrapper import PhaseMaskedFOVWrapper
+from scripts.terminal_pn_action_wrapper import TerminalPNActionWrapper
 
 
 class PatchedShareDummyVecEnv(ShareDummyVecEnv):
@@ -73,10 +75,19 @@ def _get_ap_override(ap_config_name: str) -> dict:
 
 def make_train_env(all_args):
     ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
+    obs_phase_mask = getattr(all_args, 'obs_phase_mask', 'none')
+    terminal_guidance = getattr(all_args, 'terminal_guidance', 'none')
+    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 8.0)
+    terminal_pn_max_action = getattr(all_args, 'terminal_pn_max_action', 0.8)
 
     def get_env_fn(rank):
         def init_env():
             env = FOVPenetrationEnv(config=ap_override, scenario=all_args.scenario)
+            if obs_phase_mask != 'none':
+                env = PhaseMaskedFOVWrapper(env, mode=obs_phase_mask)
+            if terminal_guidance == 'pn_los':
+                env = TerminalPNActionWrapper(env, gain=terminal_pn_gain,
+                                              max_action=terminal_pn_max_action)
             env.seed(all_args.seed + rank * 1000)
             return env
         return init_env
@@ -89,10 +100,19 @@ def make_train_env(all_args):
 
 def make_eval_env(all_args):
     ap_override = _get_ap_override(getattr(all_args, 'ap_config', 'v22'))
+    obs_phase_mask = getattr(all_args, 'obs_phase_mask', 'none')
+    terminal_guidance = getattr(all_args, 'terminal_guidance', 'none')
+    terminal_pn_gain = getattr(all_args, 'terminal_pn_gain', 8.0)
+    terminal_pn_max_action = getattr(all_args, 'terminal_pn_max_action', 0.8)
 
     def get_env_fn(rank):
         def init_env():
             env = FOVPenetrationEnv(config=ap_override, scenario=all_args.scenario)
+            if obs_phase_mask != 'none':
+                env = PhaseMaskedFOVWrapper(env, mode=obs_phase_mask)
+            if terminal_guidance == 'pn_los':
+                env = TerminalPNActionWrapper(env, gain=terminal_pn_gain,
+                                              max_action=terminal_pn_max_action)
             env.seed(all_args.seed * 50000 + rank * 10000)
             return env
         return init_env
@@ -113,6 +133,20 @@ def parse_args(args, parser):
                         help='Analytic priors config: '
                              'none=no AP, v22=decoy+escape+eff_pen, '
                              'v22_full=v22+cone_cost, v28=all AP modules')
+    parser.add_argument('--obs_phase_mask', type=str,
+                        default=os.environ.get('FOV_OBS_PHASE_MASK', 'none').strip().lower(),
+                        choices=['none', 'v60_phase', 'v65_strict_los'],
+                        help='Policy observation masking mode. v60_phase is split-phase; v65_strict_los fully hides HVT attack guidance in penetration and hides opponent/team cues in terminal.')
+    parser.add_argument('--terminal_guidance', type=str,
+                        default=os.environ.get('FOV_TERMINAL_GUIDANCE', 'none').strip().lower(),
+                        choices=['none', 'pn_los'],
+                        help='Optional policy-layer terminal guidance. pn_los replaces terminal pitch/yaw with commands from HVT LOS-rate obs[5:7].')
+    parser.add_argument('--terminal_pn_gain', type=float,
+                        default=float(os.environ.get('FOV_TERMINAL_PN_GAIN', '8.0')),
+                        help='Gain for --terminal_guidance pn_los.')
+    parser.add_argument('--terminal_pn_max_action', type=float,
+                        default=float(os.environ.get('FOV_TERMINAL_PN_MAX_ACTION', '0.8')),
+                        help='Absolute pitch/yaw action limit for --terminal_guidance pn_los.')
     all_args = parser.parse_known_args(args)[0]
     return all_args
 
@@ -179,6 +213,10 @@ def main(args):
     print(f"Obs dim: {envs.observation_space[0].shape}")
     print(f"Share obs dim: {envs.share_observation_space[0].shape}")
     print(f"Action space: {envs.action_space[0]}")
+    print(f"Obs phase mask: {getattr(all_args, 'obs_phase_mask', 'none')}")
+    print(f"Terminal guidance: {getattr(all_args, 'terminal_guidance', 'none')}")
+    if getattr(all_args, 'terminal_guidance', 'none') == 'pn_los':
+        print(f"Terminal PN gain/max_action: {all_args.terminal_pn_gain}/{all_args.terminal_pn_max_action}")
     print(f"Episode length: {all_args.episode_length}")
     print(f"Num env steps: {all_args.num_env_steps}")
     print(f"Hidden size: {all_args.hidden_size}")
