@@ -484,11 +484,30 @@ class InterceptorPolicy:
         v_closing = -(dx * dvx + dy * dvy + dz * dvz) / r
         self.closing_speed = v_closing
 
-        # V5 PN 加速度指令 — 直接输出俯仰/偏航加速度
-        # 偏航方向 PN 校正加速度 (水平平面)
-        an_yaw_cmd = self.N * v_closing * los_rate_az
-        # 俯仰方向 PN 校正加速度 + 重力补偿 (垂直平面)
-        an_pitch_cmd = self.N * v_closing * los_rate_el + G * np.cos(intc.gamma)
+        # V5 PN 加速度指令 — 使用向量投影法计算加速度向量后投影到机体轴
+        # 这样可以避免标量 LOS 角速率在倾斜/俯仰角存在时的误差
+        range_vec = np.array([dx, dy, dz], dtype=np.float64)
+        rel_vel = np.array([dvx, dvy, dvz], dtype=np.float64)  # v_target - v_interceptor
+        # los_omega_vec = cross(range, rel_vel) / r^2  (向量 LOS 角速率)
+        los_omega_vec = np.cross(range_vec, rel_vel) / max(r * r, 1e-6)
+
+        velocity_vec = np.array([vx_i, vy_i, vz_i], dtype=np.float64)
+        vel_norm = np.linalg.norm(velocity_vec)
+        velocity_axis = velocity_vec / max(vel_norm, 1.0)
+
+        # 加速度矢量 (m/s^2)
+        accel_vec = self.N * max(v_closing, 0.0) * np.cross(los_omega_vec, velocity_axis)
+
+        # 机体偏航轴与俯仰轴（单位向量）
+        yaw_axis = np.array([-np.sin(intc.heading), np.cos(intc.heading), 0.0], dtype=np.float64)
+        pitch_axis = np.array([
+            -np.sin(intc.gamma) * np.cos(intc.heading),
+            -np.sin(intc.gamma) * np.sin(intc.heading),
+            np.cos(intc.gamma),
+        ], dtype=np.float64)
+
+        an_yaw_cmd = float(np.dot(accel_vec, yaw_axis))
+        an_pitch_cmd = float(np.dot(accel_vec, pitch_axis)) + G * np.cos(intc.gamma)
 
         self.demanded_an_pitch = an_pitch_cmd
         self.demanded_an_yaw = an_yaw_cmd
