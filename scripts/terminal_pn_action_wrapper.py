@@ -21,9 +21,9 @@ class TerminalPNActionWrapper:
     terminal-phase guidance inputs.
     """
 
-    def __init__(self, env, gain: float = 8.0, max_action: float = 0.8,
+    def __init__(self, env, gain: float = 3.0, max_action: float = 0.8,
                  z_safety: float = 100.0, z_critical: float = 50.0,
-                 anti_dive: float = 0.6):
+                 anti_dive: float = 0.6, terminal_only: bool = True):
         self.env = env
         self.gain = float(gain)
         self.max_action = float(max_action)
@@ -35,6 +35,7 @@ class TerminalPNActionWrapper:
         self.z_safety = float(z_safety)
         self.z_critical = float(z_critical)
         self.anti_dive = float(anti_dive)
+        self.terminal_only = bool(terminal_only)
         self.n_agents = env.n_agents
         self.observation_space = env.observation_space
         self.share_observation_space = env.share_observation_space
@@ -92,9 +93,64 @@ class TerminalPNActionWrapper:
                 continue
             obs_i = obs_arr[agent_id]
             in_terminal = bool(flags[agent_id])
-            if in_terminal:
-                action_arr[agent_id, 1] = np.clip(-self.gain * float(obs_i[6]), -self.max_action, self.max_action)
-                action_arr[agent_id, 2] = np.clip(-self.gain * float(obs_i[5]), -self.max_action, self.max_action)
+            if in_terminal or (not self.terminal_only):
+                # vector-projection PN guidance (target is HVT, stationary)
+                # compute geometry
+                hvt = self.env.hvt
+                range_vec = np.array([hvt.x - off.x, hvt.y - off.y, hvt.z - off.z], dtype=np.float64)
+                r = max(np.linalg.norm(range_vec), 1.0)
+                # own velocity
+                psi = float(off.heading); gam = float(off.gamma); V = float(off.v)
+                vx = V * math.cos(gam) * math.cos(psi)
+                vy = V * math.cos(gam) * math.sin(psi)
+                vz = V * math.sin(gam)
+                vel_vec = np.array([vx, vy, vz], dtype=np.float64)
+                # relative velocity to stationary HVT
+                rel_vel = -vel_vec
+                # closing speed (dot of range and own_vel / r)
+                closing_speed = -np.dot(range_vec, rel_vel) / r
+                # back-half / non-closing fallback to pursuit guidance
+                bearing = math.atan2(range_vec[1], range_vec[0])
+                bearing_err = math.atan2(math.sin(bearing - psi), math.cos(bearing - psi))
+                if abs(bearing_err) > math.pi / 2 or closing_speed <= 0.0:
+                    # pure pursuit / tracking fallback
+                    an_yaw_cmd = float(np.clip(4.0 * bearing_err, -5.0, 5.0) * (9.81))
+                    los_el = math.atan2(range_vec[2], math.hypot(range_vec[0], range_vec[1]))
+                    pitch_err = math.atan2(math.sin(los_el - gam), math.cos(los_el - gam))
+                    an_pitch_cmd = float(np.clip(3.0 * pitch_err, -4.0, 4.0) * (9.81) + 9.81 * math.cos(gam))
+                else:
+                    # vector PN: los_omega_vec = cross(range, rel_vel) / r^2
+                    los_omega_vec = np.cross(range_vec, rel_vel) / max(r * r, 1e-6)
+                    vel_norm = np.linalg.norm(vel_vec)
+                    vel_axis = vel_vec / max(vel_norm, 1.0)
+                    accel_vec = self.gain * max(closing_speed, 0.0) * np.cross(los_omega_vec, vel_axis)
+                    yaw_axis = np.array([-math.sin(psi), math.cos(psi), 0.0], dtype=np.float64)
+                    pitch_axis = np.array([
+                        -math.sin(gam) * math.cos(psi),
+                        -math.sin(gam) * math.sin(psi),
+                        math.cos(gam),
+                    ], dtype=np.float64)
+                    an_yaw_cmd = float(np.dot(accel_vec, yaw_axis))
+                    an_pitch_cmd = float(np.dot(accel_vec, pitch_axis)) + 9.81 * math.cos(gam)
+                # convert acceleration commands (m/s^2) to normalized action space
+                params = getattr(off, "params", None)
+                if params is not None:
+                    an_pitch_max = float(params.get("an_pitch_max", 2.5 * 9.81))
+                    an_yaw_max = float(params.get("an_yaw_max", 5.0 * 9.81))
+                else:
+                    an_pitch_max = 2.5 * 9.81
+                    an_yaw_max = 5.0 * 9.81
+                an_pitch_trim = 9.81
+                # inverse mapping to action a[1]
+                if an_pitch_cmd >= an_pitch_trim:
+                    a1 = (an_pitch_cmd - an_pitch_trim) / max(an_pitch_max - an_pitch_trim, 1e-3)
+                else:
+                    a1 = (an_pitch_cmd - an_pitch_trim) / max(an_pitch_max + an_pitch_trim, 1e-3)
+                a2 = an_yaw_cmd / max(an_yaw_max, 1e-3)
+                a1 = float(np.clip(a1, -self.max_action, self.max_action))
+                a2 = float(np.clip(a2, -self.max_action, self.max_action))
+                action_arr[agent_id, 1] = a1
+                action_arr[agent_id, 2] = a2
                 guided_count += 1
             # --- altitude safety floor: anti-dive pull-up ---
             # Only triggered when NOT actively closing on HVT (i.e., either
